@@ -1,5 +1,6 @@
 from __future__ import annotations
-import os, threading
+import os, random, statistics, threading
+from dataclasses import replace
 from typing import List
 
 from PySide6.QtWidgets import (
@@ -7,9 +8,10 @@ from PySide6.QtWidgets import (
     QLineEdit, QPushButton, QFileDialog, QSpinBox, QDoubleSpinBox, QCheckBox, QMessageBox,
     QHBoxLayout, QComboBox
 )
-from PySide6.QtCore import Signal, QObject
+from PySide6.QtCore import Signal, QObject, Qt
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
 from ..engine.models import RockMass, JointSet, SpacingDist, CaveFace, Defaults, SecondaryRun, PrimaryBlock
@@ -21,11 +23,15 @@ from ..engine.io_formats import distributions_from_blocks, write_prm, write_sec
 class PlotWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.fig = Figure(figsize=(6,4))
+        self.fig = Figure(figsize=(6, 4))
         self.canvas = FigureCanvas(self.fig)
+        self.toolbar = NavigationToolbar(self.canvas, self)
         lay = QVBoxLayout()
+        lay.addWidget(self.toolbar)
         lay.addWidget(self.canvas)
         self.setLayout(lay)
+        self.canvas.setMinimumHeight(320)
+        self.has_data = False
 
     def plot_distributions(self, prim_stats: dict, sec_stats: dict | None = None, title: str = ""):
         self.fig.clear()
@@ -41,12 +47,46 @@ class PlotWidget(QWidget):
         ax.grid(True, which="both", linestyle=":")
         ax.legend()
         self.canvas.draw_idle()
+        self.has_data = True
+
+    def plot_lines(self, xs: List[float], ys_list: List[List[float]], labels: List[str] | None = None,
+                   title: str = "", xlabel: str = "", ylabel: str = "", logx: bool = False):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        for i, ys in enumerate(ys_list):
+            label = labels[i] if labels and i < len(labels) else None
+            ax.plot(xs, ys, label=label)
+        if logx:
+            ax.set_xscale("log")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, which="both", linestyle=":")
+        if labels:
+            ax.legend()
+        self.canvas.draw_idle()
+        self.has_data = True
+
+    def save_dialog(self, parent: QWidget, suggested_name: str = "chart.png"):
+        if not self.has_data:
+            QMessageBox.warning(parent, "No chart", "There is no chart to save yet.")
+            return
+        path, _ = QFileDialog.getSaveFileName(parent, "Save chart", suggested_name,
+                                             "PNG image (*.png);;PDF document (*.pdf);;SVG image (*.svg)")
+        if path:
+            try:
+                self.fig.savefig(path, dpi=300, bbox_inches="tight")
+            except Exception as exc:  # pragma: no cover - UI feedback
+                QMessageBox.critical(parent, "Save failed", f"Could not save chart:\n{exc}")
+            else:
+                QMessageBox.information(parent, "Chart saved", f"Chart saved to:\n{path}")
 
 class AppSignals(QObject):
     log = Signal(str)
     done_primary = Signal(list, float, str)
     done_secondary = Signal(list, float, str)
     done_hangup = Signal(dict)
+    done_monte_carlo = Signal(list, list, list, dict)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -80,6 +120,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_cave_tab(), "Cave")
         self.tabs.addTab(self._build_primary_tab(), "Primary run")
         self.tabs.addTab(self._build_secondary_tab(), "Secondary & hang-up")
+        self.tabs.addTab(self._build_monte_carlo_tab(), "Monte Carlo")
         self.tabs.addTab(self._build_defaults_tab(), "Defaults")
 
     def _build_geology_tab(self):
@@ -129,41 +170,113 @@ class MainWindow(QMainWindow):
         return w
 
     def _build_primary_tab(self):
-        w = QWidget(); g = QGridLayout(w)
-        row=0; g.addWidget(QLabel("<b>Primary run</b>"), row,0,1,2); row+=1
-        self.nblocks = QSpinBox(); self.nblocks.setRange(100,200000); self.nblocks.setValue(20000); g.addWidget(QLabel("Blocks to generate"), row,0); g.addWidget(self.nblocks,row,1); row+=1
+        w = QWidget()
+        layout = QHBoxLayout(w)
+
+        controls = QVBoxLayout()
+        controls.addWidget(QLabel("<b>Primary run</b>"))
+        self.nblocks = QSpinBox(); self.nblocks.setRange(100,200000); self.nblocks.setValue(20000)
+        controls.addWidget(QLabel("Blocks to generate"))
+        controls.addWidget(self.nblocks)
         self.btn_run_primary = QPushButton("Run primary")
         self.btn_save_prm = QPushButton("Save .PRM…"); self.btn_save_prm.setEnabled(False)
         hl = QHBoxLayout(); hl.addWidget(self.btn_run_primary); hl.addWidget(self.btn_save_prm)
-        g.addLayout(hl, row,0,1,3); row+=1
+        controls.addLayout(hl)
+        controls.addStretch(1)
+
+        layout.addLayout(controls, 0)
+
+        plot_layout = QVBoxLayout()
         self.plot_primary = PlotWidget()
-        g.addWidget(self.plot_primary, row,0,1,3); row+=1
-        w.setLayout(g)
+        plot_layout.addWidget(self.plot_primary)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self.btn_save_primary_plot = QPushButton("Save chart…")
+        self.btn_save_primary_plot.setEnabled(False)
+        btn_row.addWidget(self.btn_save_primary_plot)
+        plot_layout.addLayout(btn_row)
+        layout.addLayout(plot_layout, 1)
+
         return w
 
     def _build_secondary_tab(self):
-        w = QWidget(); g = QGridLayout(w)
-        row=0; g.addWidget(QLabel("<b>Secondary run & Hang-up</b>"), row,0,1,2); row+=1
-        self.draw_height = QDoubleSpinBox(); self.draw_height.setRange(1,2000); self.draw_height.setValue(self.secondary.draw_height); g.addWidget(QLabel("Draw height (m)"), row,0); g.addWidget(self.draw_height,row,1); row+=1
-        self.max_caving = QDoubleSpinBox(); self.max_caving.setRange(1,5000); self.max_caving.setValue(self.secondary.max_caving_height); g.addWidget(QLabel("Max caving height (m)"), row,0); g.addWidget(self.max_caving,row,1); row+=1
-        self.swell = QDoubleSpinBox(); self.swell.setRange(1.0,3.0); self.swell.setSingleStep(0.05); self.swell.setValue(self.secondary.swell_factor); g.addWidget(QLabel("Swell factor"), row,0); g.addWidget(self.swell,row,1); row+=1
-        self.draw_width = QDoubleSpinBox(); self.draw_width.setRange(1,200); self.draw_width.setValue(self.secondary.active_draw_width); g.addWidget(QLabel("Active draw width (m)"), row,0); g.addWidget(self.draw_width,row,1); row+=1
-        self.add_fines = QDoubleSpinBox(); self.add_fines.setRange(0,80); self.add_fines.setValue(self.secondary.added_fines_pct); g.addWidget(QLabel("Added fines % (dilution)"), row,0); g.addWidget(self.add_fines,row,1); row+=1
-        self.rate = QDoubleSpinBox(); self.rate.setRange(0,100); self.rate.setValue(self.secondary.rate_cm_day); g.addWidget(QLabel("Draw rate (cm/day)"), row,0); g.addWidget(self.rate,row,1); row+=1
-        self.upper_w = QDoubleSpinBox(); self.upper_w.setRange(1,50); self.upper_w.setValue(self.secondary.drawbell_upper_width); g.addWidget(QLabel("Drawbell upper width (m)"), row,0); g.addWidget(self.upper_w,row,1); row+=1
-        self.lower_w = QDoubleSpinBox(); self.lower_w.setRange(1,50); self.lower_w.setValue(self.secondary.drawbell_lower_width); g.addWidget(QLabel("Drawbell lower width (m)"), row,0); g.addWidget(self.lower_w,row,1); row+=1
-        self.hang_method = QComboBox(); self.hang_method.addItems(["Ore-pass rules (width)","Kear method (area)"]); g.addWidget(QLabel("Hang-up method"), row,0); g.addWidget(self.hang_method,row,1); row+=1
+        w = QWidget()
+        layout = QHBoxLayout(w)
 
+        controls = QVBoxLayout()
+        controls.addWidget(QLabel("<b>Secondary run & Hang-up</b>"))
+        self.draw_height = QDoubleSpinBox(); self.draw_height.setRange(1,2000); self.draw_height.setValue(self.secondary.draw_height)
+        controls.addWidget(QLabel("Draw height (m)")); controls.addWidget(self.draw_height)
+        self.max_caving = QDoubleSpinBox(); self.max_caving.setRange(1,5000); self.max_caving.setValue(self.secondary.max_caving_height)
+        controls.addWidget(QLabel("Max caving height (m)")); controls.addWidget(self.max_caving)
+        self.swell = QDoubleSpinBox(); self.swell.setRange(1.0,3.0); self.swell.setSingleStep(0.05); self.swell.setValue(self.secondary.swell_factor)
+        controls.addWidget(QLabel("Swell factor")); controls.addWidget(self.swell)
+        self.draw_width = QDoubleSpinBox(); self.draw_width.setRange(1,200); self.draw_width.setValue(self.secondary.active_draw_width)
+        controls.addWidget(QLabel("Active draw width (m)")); controls.addWidget(self.draw_width)
+        self.add_fines = QDoubleSpinBox(); self.add_fines.setRange(0,80); self.add_fines.setValue(self.secondary.added_fines_pct)
+        controls.addWidget(QLabel("Added fines % (dilution)")); controls.addWidget(self.add_fines)
+        self.rate = QDoubleSpinBox(); self.rate.setRange(0,100); self.rate.setValue(self.secondary.rate_cm_day)
+        controls.addWidget(QLabel("Draw rate (cm/day)")); controls.addWidget(self.rate)
+        self.upper_w = QDoubleSpinBox(); self.upper_w.setRange(1,50); self.upper_w.setValue(self.secondary.drawbell_upper_width)
+        controls.addWidget(QLabel("Drawbell upper width (m)")); controls.addWidget(self.upper_w)
+        self.lower_w = QDoubleSpinBox(); self.lower_w.setRange(1,50); self.lower_w.setValue(self.secondary.drawbell_lower_width)
+        controls.addWidget(QLabel("Drawbell lower width (m)")); controls.addWidget(self.lower_w)
+        self.hang_method = QComboBox(); self.hang_method.addItems(["Ore-pass rules (width)","Kear method (area)"])
+        controls.addWidget(QLabel("Hang-up method")); controls.addWidget(self.hang_method)
         self.btn_run_secondary = QPushButton("Run secondary + hang-up")
         self.btn_save_sec = QPushButton("Save .SEC…"); self.btn_save_sec.setEnabled(False)
         hl = QHBoxLayout(); hl.addWidget(self.btn_run_secondary); hl.addWidget(self.btn_save_sec)
-        g.addLayout(hl, row,0,1,3); row+=1
-        self.plot_secondary = PlotWidget()
-        g.addWidget(self.plot_secondary, row,0,1,3); row+=1
-        self.lbl_hang = QLabel("Hang-up: -")
-        g.addWidget(self.lbl_hang, row,0,1,3); row+=1
+        controls.addLayout(hl)
+        controls.addStretch(1)
 
-        w.setLayout(g)
+        layout.addLayout(controls, 0)
+
+        plot_layout = QVBoxLayout()
+        self.plot_secondary = PlotWidget()
+        plot_layout.addWidget(self.plot_secondary)
+        btn_row = QHBoxLayout(); btn_row.addStretch(1)
+        self.btn_save_secondary_plot = QPushButton("Save chart…")
+        self.btn_save_secondary_plot.setEnabled(False)
+        btn_row.addWidget(self.btn_save_secondary_plot)
+        plot_layout.addLayout(btn_row)
+        self.lbl_hang = QLabel("Hang-up: -")
+        self.lbl_hang.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        plot_layout.addWidget(self.lbl_hang)
+        layout.addLayout(plot_layout, 1)
+
+        return w
+
+    def _build_monte_carlo_tab(self):
+        w = QWidget()
+        layout = QHBoxLayout(w)
+
+        controls = QVBoxLayout()
+        controls.addWidget(QLabel("<b>Monte Carlo simulation</b>"))
+        self.mc_runs = QSpinBox(); self.mc_runs.setRange(1, 100); self.mc_runs.setValue(10)
+        controls.addWidget(QLabel("Number of runs")); controls.addWidget(self.mc_runs)
+        self.mc_blocks = QSpinBox(); self.mc_blocks.setRange(100, 50000); self.mc_blocks.setValue(5000)
+        controls.addWidget(QLabel("Blocks per run")); controls.addWidget(self.mc_blocks)
+        self.mc_variation = QDoubleSpinBox(); self.mc_variation.setRange(0.0, 100.0); self.mc_variation.setSingleStep(1.0); self.mc_variation.setValue(15.0)
+        self.mc_variation.setSuffix(" %")
+        controls.addWidget(QLabel("Parameter variation (±%)")); controls.addWidget(self.mc_variation)
+        self.btn_run_monte_carlo = QPushButton("Run Monte Carlo")
+        controls.addWidget(self.btn_run_monte_carlo)
+        controls.addStretch(1)
+
+        layout.addLayout(controls, 0)
+
+        plot_layout = QVBoxLayout()
+        self.plot_monte_carlo = PlotWidget()
+        plot_layout.addWidget(self.plot_monte_carlo)
+        btn_row = QHBoxLayout(); btn_row.addStretch(1)
+        self.btn_save_mc_plot = QPushButton("Save chart…")
+        self.btn_save_mc_plot.setEnabled(False)
+        btn_row.addWidget(self.btn_save_mc_plot)
+        plot_layout.addLayout(btn_row)
+        self.lbl_mc_stats = QLabel("Monte Carlo: -")
+        plot_layout.addWidget(self.lbl_mc_stats)
+        layout.addLayout(plot_layout, 1)
+
         return w
 
     def _build_defaults_tab(self):
@@ -180,9 +293,14 @@ class MainWindow(QMainWindow):
         self.btn_save_prm.clicked.connect(self.on_save_prm)
         self.btn_run_secondary.clicked.connect(self.on_run_secondary)
         self.btn_save_sec.clicked.connect(self.on_save_sec)
+        self.btn_save_primary_plot.clicked.connect(lambda: self.plot_primary.save_dialog(self, "primary_distribution.png"))
+        self.btn_save_secondary_plot.clicked.connect(lambda: self.plot_secondary.save_dialog(self, "secondary_distribution.png"))
+        self.btn_run_monte_carlo.clicked.connect(self.on_run_monte_carlo)
+        self.btn_save_mc_plot.clicked.connect(lambda: self.plot_monte_carlo.save_dialog(self, "monte_carlo.png"))
         self.sig.done_primary.connect(self.on_done_primary)
         self.sig.done_secondary.connect(self.on_done_secondary)
         self.sig.done_hangup.connect(self.on_done_hangup)
+        self.sig.done_monte_carlo.connect(self.on_done_monte_carlo)
 
     def update_models_from_ui(self):
         self.rock = RockMass(
@@ -249,6 +367,7 @@ class MainWindow(QMainWindow):
         stats = distributions_from_blocks(blocks)
         self.plot_primary.plot_distributions(stats, None, title="Primary fragmentation (cum. mass)")
         self.btn_save_prm.setEnabled(True)
+        self.btn_save_primary_plot.setEnabled(True)
         QMessageBox.information(self, "Primary run complete", f"Generated {len(blocks)} blocks.\nTemporary .PRM written to:\n{path}")
 
     def on_save_prm(self):
@@ -281,6 +400,7 @@ class MainWindow(QMainWindow):
         sec_stats = distributions_from_blocks([P(b) for b in sec_blocks])
         self.plot_secondary.plot_distributions(prim_stats, sec_stats, title="Primary vs Secondary (cum. mass)")
         self.btn_save_sec.setEnabled(True)
+        self.btn_save_secondary_plot.setEnabled(True)
 
         if self.hang_method.currentText().startswith("Ore-pass"):
             stats = orepass_hangups(sec_blocks, bell_width=self.secondary.drawbell_lower_width, seed=self.defaults.seed or 1234)
@@ -303,6 +423,114 @@ class MainWindow(QMainWindow):
 
     def on_done_hangup(self, stats: dict):
         self.lbl_hang.setText(f"Hang-ups → High: {stats['n_high']}  Low: {stats['n_low']}  Total hang-up tons (proxy): {stats['total_hangup_tons']:.1f} t")
+
+    def _randomize_value(self, value: float, variation_pct: float, minimum: float | None = None, maximum: float | None = None):
+        if variation_pct <= 0:
+            new_val = value
+        else:
+            delta = variation_pct / 100.0
+            new_val = value * (1.0 + random.uniform(-delta, delta))
+        if minimum is not None:
+            new_val = max(minimum, new_val)
+        if maximum is not None:
+            new_val = min(maximum, new_val)
+        return new_val
+
+    def _randomize_joint_set(self, js: JointSet, variation_pct: float) -> JointSet:
+        spacing_vals = [
+            self._randomize_value(js.spacing.min, variation_pct, 0.01),
+            self._randomize_value(js.spacing.mean, variation_pct, 0.02),
+            self._randomize_value(js.spacing.max_or_90pct, variation_pct, 0.05),
+        ]
+        spacing_vals.sort()
+        spacing = SpacingDist(
+            js.spacing.type,
+            spacing_vals[0],
+            max(spacing_vals[0], spacing_vals[1]),
+            max(spacing_vals[1], spacing_vals[2])
+        )
+        return JointSet(
+            name=js.name,
+            mean_dip=self._randomize_value(js.mean_dip, variation_pct, 0.0, 90.0),
+            dip_range=self._randomize_value(js.dip_range, variation_pct, 0.0, 90.0),
+            mean_dip_dir=self._randomize_value(js.mean_dip_dir, variation_pct, 0.0, 360.0),
+            dip_dir_range=self._randomize_value(js.dip_dir_range, variation_pct, 0.0, 180.0),
+            spacing=spacing,
+            JC=int(round(self._randomize_value(js.JC, variation_pct, 0, 40)))
+        )
+
+    def on_run_monte_carlo(self):
+        self.update_models_from_ui()
+        runs = int(self.mc_runs.value())
+        nblocks = int(self.mc_blocks.value())
+        variation = float(self.mc_variation.value())
+
+        def work():
+            results = []
+            avg_volumes = []
+            for _ in range(runs):
+                rock = RockMass(
+                    rock_type=self.rock.rock_type,
+                    MRMR=self._randomize_value(self.rock.MRMR, variation, 0.0, 100.0),
+                    IRS=self._randomize_value(self.rock.IRS, variation, 1.0, 500.0),
+                    IBS=self.rock.IBS,
+                    mi=self._randomize_value(self.rock.mi, variation, 1.0, 50.0),
+                    frac_freq=self._randomize_value(self.rock.frac_freq, variation, 0.0, 20.0),
+                    frac_condition=int(round(self._randomize_value(self.rock.frac_condition, variation, 0, 40))),
+                    density=self._randomize_value(self.rock.density, variation, 1500.0, 4500.0),
+                )
+                joint_sets = [self._randomize_joint_set(js, variation) for js in self.joint_sets]
+                cave = replace(self.cave, spalling_pct=self._randomize_value(self.cave.spalling_pct, variation, 0.0, 100.0))
+                defaults = replace(self.defaults, seed=random.randint(0, 10**9))
+                blocks = generate_primary_blocks(nblocks, rock, joint_sets, cave, defaults, seed=defaults.seed)
+                stats = distributions_from_blocks(blocks)
+                results.append(stats)
+                avg_volumes.append(stats["avg_volume"])
+
+            if not results:
+                return
+
+            xs = [lo for lo, _ in results[0]["bins"]]
+            cum_mass_runs = [stats["cum_mass"] for stats in results]
+            avg_line = [statistics.mean(vals) for vals in zip(*cum_mass_runs)]
+            min_line = [min(vals) for vals in zip(*cum_mass_runs)]
+            max_line = [max(vals) for vals in zip(*cum_mass_runs)]
+            info = {
+                "runs": runs,
+                "variation_pct": variation,
+                "mean_avg_volume": statistics.mean(avg_volumes) if avg_volumes else 0.0,
+                "min_avg_volume": min(avg_volumes) if avg_volumes else 0.0,
+                "max_avg_volume": max(avg_volumes) if avg_volumes else 0.0,
+            }
+            self.sig.done_monte_carlo.emit(
+                xs,
+                [avg_line, min_line, max_line],
+                ["Average cumulative mass", "Minimum cumulative mass", "Maximum cumulative mass"],
+                info,
+            )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_done_monte_carlo(self, xs: List[float], lines: List[List[float]], labels: List[str], info: dict):
+        self.plot_monte_carlo.plot_lines(
+            xs,
+            lines,
+            labels=labels,
+            title="Monte Carlo cumulative mass envelopes",
+            xlabel="Block volume (m³)",
+            ylabel="Cumulative mass (%)",
+            logx=True,
+        )
+        self.lbl_mc_stats.setText(
+            "Monte Carlo runs: {runs} | Avg volume {mean:.2f} m³ (min {min:.2f}, max {max:.2f}) | Variation ±{var:.1f}%".format(
+                runs=info.get("runs", 0),
+                mean=info.get("mean_avg_volume", 0.0),
+                min=info.get("min_avg_volume", 0.0),
+                max=info.get("max_avg_volume", 0.0),
+                var=info.get("variation_pct", 0.0),
+            )
+        )
+        self.btn_save_mc_plot.setEnabled(True)
 
 def launch():
     app = QApplication([])
