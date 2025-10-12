@@ -19,7 +19,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 from matplotlib.ticker import ScalarFormatter, StrMethodFormatter
-from matplotlib.colors import to_rgba
+from matplotlib.colors import to_rgba, to_hex
 
 from ..engine.models import RockMass, JointSet, SpacingDist, CaveFace, Defaults, SecondaryRun, PrimaryBlock
 from ..engine.primary import generate_primary_blocks
@@ -251,6 +251,7 @@ class PlotWidget(QWidget):
         x_formatter=None,
         y_formatter=None,
         envelopes: List[Dict[str, object]] | None = None,
+        axis_limits: Dict[str, Tuple[Optional[float], Optional[float]]] | None = None,
     ):
         self.fig.clear()
         ax = self.fig.add_subplot(111)
@@ -326,6 +327,19 @@ class PlotWidget(QWidget):
             ax.xaxis.set_major_formatter(x_formatter)
         if y_formatter is not None:
             ax.yaxis.set_major_formatter(y_formatter)
+        if axis_limits:
+            x_limits = axis_limits.get("x") if isinstance(axis_limits, dict) else None
+            y_limits = axis_limits.get("y") if isinstance(axis_limits, dict) else None
+            if x_limits:
+                try:
+                    ax.set_xlim(left=x_limits[0], right=x_limits[1])
+                except ValueError:
+                    pass
+            if y_limits:
+                try:
+                    ax.set_ylim(bottom=y_limits[0], top=y_limits[1])
+                except ValueError:
+                    pass
         self.canvas.draw_idle()
         self.has_data = True
 
@@ -425,8 +439,10 @@ class MainWindow(QMainWindow):
         self._series_color_cursor = 0
         self._chart_title_widgets: Dict[str, QLineEdit] = {}
         self._axis_format_combos: Dict[str, QComboBox] = {}
+        self._axis_limit_widgets: Dict[str, Dict[str, QLineEdit]] = {}
         self._series_random_defaults: Dict[str, Tuple[int, int, float]] = {}
         self._combo_style_cache: Dict[str, dict] = {}
+        self._next_combo_color_index = 0
 
         self._build_tabs()
         self._connect_signals()
@@ -968,6 +984,7 @@ class MainWindow(QMainWindow):
 
         self._chart_title_widgets.clear()
         self._axis_format_combos.clear()
+        self._axis_limit_widgets.clear()
 
         title_group = QGroupBox("Chart titles")
         title_layout = QGridLayout(title_group)
@@ -1002,6 +1019,39 @@ class MainWindow(QMainWindow):
         combo_x.currentIndexChanged.connect(self._refresh_all_plots)
         combo_y.currentIndexChanged.connect(self._refresh_all_plots)
         layout.addWidget(axis_group)
+
+        limit_group = QGroupBox("Axis limits")
+        limit_layout = QGridLayout(limit_group)
+        limit_layout.setColumnStretch(2, 1)
+        limit_layout.addWidget(QLabel(""), 0, 0)
+        limit_layout.addWidget(QLabel("Min"), 0, 1)
+        limit_layout.addWidget(QLabel("Max"), 0, 2)
+
+        x_label = QLabel("Volume axis (X)")
+        limit_layout.addWidget(x_label, 1, 0)
+        x_min_edit = QLineEdit()
+        x_min_edit.setPlaceholderText("Auto")
+        limit_layout.addWidget(x_min_edit, 1, 1)
+        x_max_edit = QLineEdit()
+        x_max_edit.setPlaceholderText("Auto")
+        limit_layout.addWidget(x_max_edit, 1, 2)
+        self._axis_limit_widgets["x"] = {"min": x_min_edit, "max": x_max_edit}
+
+        y_label = QLabel("Cumulative axis (Y)")
+        limit_layout.addWidget(y_label, 2, 0)
+        y_min_edit = QLineEdit()
+        y_min_edit.setPlaceholderText("Auto")
+        limit_layout.addWidget(y_min_edit, 2, 1)
+        y_max_edit = QLineEdit()
+        y_max_edit.setPlaceholderText("Auto")
+        limit_layout.addWidget(y_max_edit, 2, 2)
+        self._axis_limit_widgets["y"] = {"min": y_min_edit, "max": y_max_edit}
+
+        for axis_entries in self._axis_limit_widgets.values():
+            for widget in axis_entries.values():
+                widget.textChanged.connect(self._refresh_all_plots)
+
+        layout.addWidget(limit_group)
 
         legend_group = QGroupBox("Legend")
         legend_layout = QHBoxLayout(legend_group)
@@ -1184,6 +1234,14 @@ class MainWindow(QMainWindow):
                 for axis, combo in self._axis_format_combos.items()
                 if isinstance(combo, QComboBox)
             },
+            "axis_limits": {
+                axis: {
+                    bound: widget.text().strip()
+                    for bound, widget in entries.items()
+                    if isinstance(widget, QLineEdit)
+                }
+                for axis, entries in self._axis_limit_widgets.items()
+            },
             "legend_enabled": bool(self.chk_show_legend.isChecked()) if hasattr(self, "chk_show_legend") else self._legend_enabled,
             "series_styles": {
                 label: self._collect_series_style(label)
@@ -1364,6 +1422,20 @@ class MainWindow(QMainWindow):
                         prev = combo.blockSignals(True)
                         combo.setCurrentIndex(idx)
                         combo.blockSignals(prev)
+
+        axis_limits = state.get("axis_limits")
+        if isinstance(axis_limits, dict):
+            for axis, entries in axis_limits.items():
+                widgets = self._axis_limit_widgets.get(axis, {})
+                if not isinstance(entries, dict):
+                    continue
+                for bound, value in entries.items():
+                    widget = widgets.get(bound)
+                    if isinstance(widget, QLineEdit):
+                        text = "" if value is None else str(value)
+                        prev = widget.blockSignals(True)
+                        widget.setText(text)
+                        widget.blockSignals(prev)
 
         legend_enabled = state.get("legend_enabled")
         if legend_enabled is not None and hasattr(self, "chk_show_legend"):
@@ -1922,6 +1994,7 @@ class MainWindow(QMainWindow):
             styles=styles,
             x_formatter=self._axis_formatter_from_choice(self._axis_format_choice("x")),
             y_formatter=self._axis_formatter_from_choice(self._axis_format_choice("y")),
+            axis_limits=self._resolved_axis_limits(logx=True),
         )
 
     def _refresh_secondary_plot(self):
@@ -1959,6 +2032,7 @@ class MainWindow(QMainWindow):
             styles=style_lookup,
             x_formatter=self._axis_formatter_from_choice(self._axis_format_choice("x")),
             y_formatter=self._axis_formatter_from_choice(self._axis_format_choice("y")),
+            axis_limits=self._resolved_axis_limits(logx=True),
         )
 
     def _axis_format_choice(self, axis: str) -> str:
@@ -1966,6 +2040,39 @@ class MainWindow(QMainWindow):
         if isinstance(combo, QComboBox):
             return combo.currentText() or "Auto"
         return "Auto"
+
+    def _axis_limit_value(self, axis: str, bound: str) -> Optional[float]:
+        widget = self._axis_limit_widgets.get(axis, {}).get(bound)
+        if isinstance(widget, QLineEdit):
+            text = widget.text().strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except ValueError:
+                return None
+        return None
+
+    def _resolved_axis_limits(self, *, logx: bool) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+        limits: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+        x_min = self._axis_limit_value("x", "min")
+        x_max = self._axis_limit_value("x", "max")
+        if logx:
+            if x_min is not None and x_min <= 0:
+                x_min = None
+            if x_max is not None and x_max <= 0:
+                x_max = None
+        if x_min is not None and x_max is not None and x_max <= x_min:
+            x_max = None
+        if x_min is not None or x_max is not None:
+            limits["x"] = (x_min, x_max)
+        y_min = self._axis_limit_value("y", "min")
+        y_max = self._axis_limit_value("y", "max")
+        if y_min is not None and y_max is not None and y_max <= y_min:
+            y_max = None
+        if y_min is not None or y_max is not None:
+            limits["y"] = (y_min, y_max)
+        return limits
 
     def _chart_title(self, key: str, fallback: str) -> str:
         widget = self._chart_title_widgets.get(key)
@@ -2049,6 +2156,7 @@ class MainWindow(QMainWindow):
                 x_formatter=self._axis_formatter_from_choice(self._axis_format_choice("x")),
                 y_formatter=self._axis_formatter_from_choice(self._axis_format_choice("y")),
                 envelopes=envelopes if use_shaded else None,
+                axis_limits=self._resolved_axis_limits(logx=True),
             )
             self.btn_save_mc_plot.setEnabled(True)
         else:
@@ -2310,12 +2418,45 @@ class MainWindow(QMainWindow):
         color = color_combo.currentData() if isinstance(color_combo, QComboBox) else None
         linestyle = dash_combo.currentData() if isinstance(dash_combo, QComboBox) else "-"
         linewidth = width_spin.value() if isinstance(width_spin, QDoubleSpinBox) else 1.5
+        if color:
+            role = self._series_role(label)
+            color = self._color_for_role(color, role)
         return {
             "label": custom_label,
             "color": color,
             "linestyle": linestyle or "-",
             "linewidth": linewidth,
         }
+
+    def _series_role(self, label: str) -> Optional[str]:
+        text = label.strip().lower()
+        if text.startswith("p "):
+            return "primary"
+        if text.startswith("s "):
+            return "secondary"
+        return None
+
+    def _color_for_role(self, color: str, role: Optional[str]) -> str:
+        if not role:
+            return color
+        try:
+            r, g, b, _ = to_rgba(color)
+        except ValueError:
+            return color
+        if role == "primary":
+            factor = 0.2
+            r *= (1.0 - factor)
+            g *= (1.0 - factor)
+            b *= (1.0 - factor)
+        elif role == "secondary":
+            factor = 0.4
+            r = r + (1.0 - r) * factor
+            g = g + (1.0 - g) * factor
+            b = b + (1.0 - b) * factor
+        r = min(max(r, 0.0), 1.0)
+        g = min(max(g, 0.0), 1.0)
+        b = min(max(b, 0.0), 1.0)
+        return to_hex((r, g, b, 1.0), keep_alpha=False)
 
     def _should_randomize_series(self, label: str) -> bool:
         text = label.lower()
@@ -2337,6 +2478,27 @@ class MainWindow(QMainWindow):
             return "max"
         return "line"
 
+    def _assign_combo_color_index(self) -> int:
+        total = len(MC_COLOR_OPTIONS)
+        if total <= 0:
+            return 0
+        order = list(range(total))
+        if total > 2:
+            order = order[2:] + order[:2]
+        used = {
+            cache.get("color")
+            for cache in self._combo_style_cache.values()
+            if isinstance(cache, dict)
+        }
+        for pos, idx in enumerate(order):
+            if idx not in used:
+                self._next_combo_color_index = pos + 1
+                return idx
+        pos = self._next_combo_color_index % len(order)
+        idx = order[pos]
+        self._next_combo_color_index = pos + 1
+        return idx
+
     def _randomized_series_defaults(self, label: str) -> Tuple[int, int, float]:
         cached = self._series_random_defaults.get(label)
         if cached:
@@ -2344,12 +2506,9 @@ class MainWindow(QMainWindow):
         combo_key = self._series_combo_key(label)
         cache = self._combo_style_cache.get(combo_key)
         if not cache:
+            color_idx = self._assign_combo_color_index()
             seed = abs(hash(combo_key)) & 0xFFFFFFFF
             rng = random.Random(seed)
-            color_choices = list(range(len(MC_COLOR_OPTIONS)))
-            if len(color_choices) > 2:
-                color_choices = color_choices[2:]
-            color_idx = color_choices[rng.randrange(len(color_choices))] if color_choices else 0
             dash_palettes = [
                 {"avg": "-", "min": "--", "max": "-."},
                 {"avg": "-", "min": ":", "max": "--"},
