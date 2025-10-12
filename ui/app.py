@@ -1,14 +1,16 @@
 from __future__ import annotations
 import json, os, random, statistics, threading
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from datetime import datetime
 from dataclasses import asdict
-from typing import Dict, List, Tuple
+from itertools import combinations
+from typing import Dict, List, Tuple, Optional
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QGridLayout, QLabel,
     QLineEdit, QPushButton, QFileDialog, QSpinBox, QDoubleSpinBox, QCheckBox, QMessageBox,
-    QHBoxLayout, QComboBox, QGroupBox
+    QHBoxLayout, QComboBox, QGroupBox, QFrame
 )
 from PySide6.QtCore import Signal, QObject, Qt
 
@@ -96,7 +98,9 @@ def _monte_carlo_worker(
     nblocks: int,
     variation: float,
     base_inputs: Dict[str, object],
-) -> Tuple[dict, dict]:
+    combination: Optional[Tuple[int, int, int]] = None,
+    combo_label: Optional[str] = None,
+) -> Tuple[str, dict, dict]:
     rng = random.Random(seed)
 
     rock_dict = base_inputs.get("rock", {})
@@ -111,7 +115,7 @@ def _monte_carlo_worker(
         density=randomize_value(rock_dict.get("density", 3200.0), variation, 1500.0, 4500.0, rng=rng),
     )
 
-    joint_sets = []
+    randomized_sets: List[JointSet] = []
     for js_dict in base_inputs.get("joint_sets", []):
         spacing_dict = js_dict.get("spacing", {})
         spacing = SpacingDist(
@@ -130,7 +134,15 @@ def _monte_carlo_worker(
             spacing=spacing,
             JC=js_dict.get("JC", 20),
         )
-        joint_sets.append(randomize_joint_set(js, variation, rng=rng))
+        randomized_sets.append(randomize_joint_set(js, variation, rng=rng))
+
+    if combination is not None:
+        joint_sets = [randomized_sets[i] for i in combination if 0 <= i < len(randomized_sets)]
+    else:
+        joint_sets = list(randomized_sets)
+
+    if len(joint_sets) < 3:
+        raise ValueError("Monte Carlo worker requires at least three joint sets.")
 
     cave_dict = base_inputs.get("cave", {})
     cave = CaveFace(
@@ -180,7 +192,8 @@ def _monte_carlo_worker(
         primary_fines_ratio=primary_fines_ratio,
     )
     secondary_stats = distributions_from_blocks(sec_blocks)
-    return primary_stats, secondary_stats
+    label = combo_label or "+".join(js.name for js in joint_sets[:3])
+    return label, primary_stats, secondary_stats
 
 
 class PlotWidget(QWidget):
@@ -327,10 +340,208 @@ class MainWindow(QMainWindow):
         self._build_tabs()
         self._connect_signals()
         self._ensure_series_style_controls(["Primary", "Secondary"])
+        self._update_combination_controls()
 
     def _set_uniform_input_width(self, widget):
         widget.setMinimumWidth(140)
         widget.setMaximumWidth(220)
+
+    def _joint_widget_display_name(self, index: int) -> str:
+        if 0 <= index < len(self.joint_widgets):
+            name_widget = self.joint_widgets[index].get("name")
+            if isinstance(name_widget, QLineEdit):
+                text = name_widget.text().strip()
+                if text:
+                    return text
+        return f"Set{index + 1}"
+
+    def _refresh_joint_remove_buttons(self):
+        allow_remove = len(self.joint_widgets) > 3
+        for entry in self.joint_widgets:
+            btn = entry.get("remove")
+            if isinstance(btn, QPushButton):
+                btn.setEnabled(allow_remove)
+
+    def _add_joint_set_widget(self, joint_set: JointSet | None = None, *, suppress_update: bool = False):
+        js = joint_set or JointSet(
+            name=f"Set{len(self.joint_widgets) + 1}",
+            mean_dip=45.0,
+            dip_range=10.0,
+            mean_dip_dir=0.0,
+            dip_dir_range=20.0,
+            spacing=SpacingDist("trunc_exp", 0.3, 1.0, 3.0),
+            JC=20,
+        )
+        frame = QFrame()
+        frame.setFrameShape(QFrame.StyledPanel)
+        layout = QGridLayout(frame)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(6)
+
+        name_edit = QLineEdit(js.name)
+        self._set_uniform_input_width(name_edit)
+        remove_btn = QPushButton("Remove")
+        remove_btn.setAutoDefault(False)
+        remove_btn.setDefault(False)
+
+        dip = QDoubleSpinBox(); dip.setRange(0, 90); dip.setValue(js.mean_dip); self._set_uniform_input_width(dip)
+        dipr = QDoubleSpinBox(); dipr.setRange(0, 90); dipr.setValue(js.dip_range); self._set_uniform_input_width(dipr)
+        dd = QDoubleSpinBox(); dd.setRange(0, 360); dd.setValue(js.mean_dip_dir); self._set_uniform_input_width(dd)
+        ddr = QDoubleSpinBox(); ddr.setRange(0, 180); ddr.setValue(js.dip_dir_range); self._set_uniform_input_width(ddr)
+        jc = QSpinBox(); jc.setRange(0, 40); jc.setValue(js.JC); self._set_uniform_input_width(jc)
+
+        spacing_min = getattr(js.spacing, "min", 0.3)
+        spacing_mean = getattr(js.spacing, "mean", spacing_min)
+        spacing_max = getattr(js.spacing, "max_or_90pct", max(spacing_mean, spacing_min))
+
+        s_min = QDoubleSpinBox(); s_min.setRange(0.01, 50); s_min.setDecimals(2); s_min.setValue(spacing_min); self._set_uniform_input_width(s_min)
+        s_mean = QDoubleSpinBox(); s_mean.setRange(0.02, 50); s_mean.setDecimals(2); s_mean.setValue(spacing_mean); self._set_uniform_input_width(s_mean)
+        s_max = QDoubleSpinBox(); s_max.setRange(0.03, 200); s_max.setDecimals(2); s_max.setValue(spacing_max); self._set_uniform_input_width(s_max)
+
+        layout.addWidget(QLabel("Name"), 0, 0)
+        layout.addWidget(name_edit, 0, 1)
+        layout.addWidget(remove_btn, 0, 2)
+        layout.addWidget(QLabel("Dip / Range"), 1, 0)
+        layout.addWidget(dip, 1, 1)
+        layout.addWidget(dipr, 1, 2)
+        layout.addWidget(QLabel("Dip dir / Range"), 2, 0)
+        layout.addWidget(dd, 2, 1)
+        layout.addWidget(ddr, 2, 2)
+        layout.addWidget(QLabel("JC (0–40)"), 3, 0)
+        layout.addWidget(jc, 3, 1)
+        layout.addWidget(QLabel("Spacing min / mean / max"), 4, 0)
+        layout.addWidget(s_min, 4, 1)
+        layout.addWidget(s_mean, 4, 2)
+        layout.addWidget(s_max, 4, 3)
+        layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(2, 1)
+        layout.setColumnStretch(3, 1)
+
+        entry: Dict[str, QWidget] = {}
+        entry.update({
+            "frame": frame,
+            "name": name_edit,
+            "dip": dip,
+            "dip_range": dipr,
+            "dip_dir": dd,
+            "dip_dir_range": ddr,
+            "jc": jc,
+            "spacing_min": s_min,
+            "spacing_mean": s_mean,
+            "spacing_max": s_max,
+            "remove": remove_btn,
+        })
+
+        def handle_remove():
+            self._remove_joint_set_widget(entry)
+
+        def handle_name_change():
+            frame.setProperty("joint_set_name", name_edit.text())
+            self._update_combination_controls()
+
+        remove_btn.clicked.connect(handle_remove)
+        name_edit.editingFinished.connect(self._update_combination_controls)
+        name_edit.textChanged.connect(handle_name_change)
+
+        self.joint_widgets.append(entry)
+        if hasattr(self, "joint_sets_container"):
+            self.joint_sets_container.addWidget(frame)
+        self._refresh_joint_remove_buttons()
+        if not suppress_update:
+            self._update_combination_controls()
+
+    def _remove_joint_set_widget(self, entry: Dict[str, QWidget]):
+        if entry not in self.joint_widgets:
+            return
+        if len(self.joint_widgets) <= 3:
+            QMessageBox.warning(self, "Cannot remove", "At least three joint sets are required for analysis.")
+            return
+        self.joint_widgets.remove(entry)
+        frame = entry.get("frame")
+        if isinstance(frame, QWidget):
+            frame.setParent(None)
+            frame.deleteLater()
+        self._refresh_joint_remove_buttons()
+        self._update_combination_controls()
+
+    def _update_joint_combination_controls(self):
+        combo = getattr(self, "combo_joint_combination", None)
+        if not isinstance(combo, QComboBox):
+            return
+        current_data = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        count = len(self.joint_widgets)
+        available = list(combinations(range(count), 3)) if count >= 3 else []
+        if available:
+            for idxs in available:
+                label = " + ".join(self._joint_widget_display_name(i) for i in idxs)
+                combo.addItem(label, idxs)
+            if current_data in available:
+                combo.setCurrentIndex(available.index(current_data))
+            else:
+                combo.setCurrentIndex(0)
+            combo.setEnabled(True)
+        else:
+            combo.addItem("Add at least three joint sets", None)
+            combo.setEnabled(False)
+        combo.blockSignals(False)
+
+    def _update_monte_carlo_combination_controls(self):
+        combo = getattr(self, "combo_mc_combinations", None)
+        if not isinstance(combo, QComboBox):
+            return
+        current_data = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        count = len(self.joint_widgets)
+        available = list(combinations(range(count), 3)) if count >= 3 else []
+        combo.addItem("Use geology selection", ("geology", None))
+        for idxs in available:
+            label = " + ".join(self._joint_widget_display_name(i) for i in idxs)
+            combo.addItem(label, ("combo", idxs))
+        if len(available) > 1:
+            combo.addItem("All combinations", ("all", None))
+        if current_data is not None:
+            idx = combo.findData(current_data)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+    def _update_combination_controls(self):
+        self._update_joint_combination_controls()
+        self._update_monte_carlo_combination_controls()
+
+    def _selected_joint_combination_indexes(self) -> Optional[Tuple[int, int, int]]:
+        combo = getattr(self, "combo_joint_combination", None)
+        if not isinstance(combo, QComboBox):
+            return None
+        data = combo.currentData()
+        if isinstance(data, tuple) and len(data) == 3:
+            return data
+        return None
+
+    def _selected_joint_sets(self) -> List[JointSet]:
+        idxs = self._selected_joint_combination_indexes()
+        if not idxs:
+            return []
+        return [self.joint_sets[i] for i in idxs if 0 <= i < len(self.joint_sets)]
+
+    def _combination_label(self, indexes: Tuple[int, int, int], names: Optional[List[str]] = None) -> str:
+        if names is None:
+            names = [js.name for js in self.joint_sets]
+        parts = []
+        for idx in indexes:
+            if 0 <= idx < len(names):
+                part = names[idx] or f"Set{idx + 1}"
+            else:
+                part = f"Set{idx + 1}"
+            parts.append(part)
+        return " + ".join(parts)
+
+    def _all_joint_combinations(self) -> List[Tuple[int, int, int]]:
+        return list(combinations(range(len(self.joint_sets)), 3)) if len(self.joint_sets) >= 3 else []
 
     def _build_tabs(self):
         self.tabs.addTab(self._build_geology_tab(), "Geology")
@@ -352,25 +563,36 @@ class MainWindow(QMainWindow):
         self.fc = QSpinBox(); self.fc.setRange(0,40); self.fc.setValue(self.rock.frac_condition); self._set_uniform_input_width(self.fc); g.addWidget(QLabel("Fracture/veinlet condition (0–40)"), row,0); g.addWidget(self.fc,row,1); row+=1
         self.density = QDoubleSpinBox(); self.density.setRange(1500,4500); self.density.setValue(self.rock.density); self._set_uniform_input_width(self.density); g.addWidget(QLabel("Density (kg/m³)"), row,0); g.addWidget(self.density,row,1); row+=1
 
-        row+=1; g.addWidget(QLabel("<b>Joint sets</b>"), row,0,1,2); row+=1
+        row += 1
+        g.addWidget(QLabel("<b>Joint sets</b>"), row, 0, 1, 2)
+        row += 1
         self.joint_widgets = []
-        for i,js in enumerate(self.joint_sets):
-            g.addWidget(QLabel(f"<u>{js.name}</u>"), row,0,1,2); row+=1
-            dip = QDoubleSpinBox(); dip.setRange(0,90); dip.setValue(js.mean_dip); self._set_uniform_input_width(dip)
-            dipr= QDoubleSpinBox(); dipr.setRange(0,90); dipr.setValue(js.dip_range); self._set_uniform_input_width(dipr)
-            dd  = QDoubleSpinBox(); dd.setRange(0,360); dd.setValue(js.mean_dip_dir); self._set_uniform_input_width(dd)
-            ddr = QDoubleSpinBox(); ddr.setRange(0,180); ddr.setValue(js.dip_dir_range); self._set_uniform_input_width(ddr)
-            jc  = QSpinBox(); jc.setRange(0,40); jc.setValue(js.JC); self._set_uniform_input_width(jc)
-            s_min=QDoubleSpinBox(); s_min.setRange(0.01,50); s_min.setDecimals(2); s_min.setValue(js.spacing.min); self._set_uniform_input_width(s_min)
-            s_mean=QDoubleSpinBox(); s_mean.setRange(0.02,50); s_mean.setDecimals(2); s_mean.setValue(js.spacing.mean); self._set_uniform_input_width(s_mean)
-            s_max=QDoubleSpinBox(); s_max.setRange(0.03,200); s_max.setDecimals(2); s_max.setValue(js.spacing.max_or_90pct); self._set_uniform_input_width(s_max)
+        joint_sets_widget = QWidget()
+        self.joint_sets_container = QVBoxLayout()
+        self.joint_sets_container.setContentsMargins(0, 0, 0, 0)
+        self.joint_sets_container.setSpacing(12)
+        joint_sets_widget.setLayout(self.joint_sets_container)
+        g.addWidget(joint_sets_widget, row, 0, 1, 4)
+        row += 1
+        for js in self.joint_sets:
+            self._add_joint_set_widget(js, suppress_update=True)
 
-            g.addWidget(QLabel("Dip / Range"), row,0); g.addWidget(dip,row,1); g.addWidget(dipr,row,2); row+=1
-            g.addWidget(QLabel("Dip dir / Range"), row,0); g.addWidget(dd,row,1); g.addWidget(ddr,row,2); row+=1
-            g.addWidget(QLabel("JC (0–40)"), row,0); g.addWidget(jc,row,1); row+=1
-            g.addWidget(QLabel("Spacing min / mean / max"), row,0); g.addWidget(s_min,row,1); g.addWidget(s_mean,row,2); g.addWidget(s_max,row,3); row+=1
+        btn_row = QHBoxLayout()
+        self.btn_add_joint_set = QPushButton("Add joint set")
+        btn_row.addWidget(self.btn_add_joint_set)
+        btn_row.addStretch(1)
+        g.addLayout(btn_row, row, 0, 1, 4)
+        row += 1
 
-            self.joint_widgets.append((dip,dipr,dd,ddr,jc,s_min,s_mean,s_max))
+        combo_row = QHBoxLayout()
+        combo_row.addWidget(QLabel("Joint set combination (3 sets):"))
+        self.combo_joint_combination = QComboBox()
+        combo_row.addWidget(self.combo_joint_combination)
+        combo_row.addStretch(1)
+        g.addLayout(combo_row, row, 0, 1, 4)
+        row += 1
+
+        self._update_joint_combination_controls()
 
         w.setLayout(g)
         return w
@@ -415,6 +637,8 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_save_primary_plot)
         plot_layout.addLayout(btn_row)
         layout.addLayout(plot_layout, 1)
+
+        self._update_monte_carlo_combination_controls()
 
         return w
 
@@ -479,6 +703,9 @@ class MainWindow(QMainWindow):
         self.mc_variation = QDoubleSpinBox(); self.mc_variation.setRange(0.0, 100.0); self.mc_variation.setSingleStep(1.0); self.mc_variation.setValue(15.0)
         self.mc_variation.setSuffix(" %")
         controls.addWidget(QLabel("Parameter variation (±%)")); controls.addWidget(self.mc_variation)
+        controls.addWidget(QLabel("Joint set combinations"))
+        self.combo_mc_combinations = QComboBox()
+        controls.addWidget(self.combo_mc_combinations)
         self.btn_run_monte_carlo = QPushButton("Run Monte Carlo")
         controls.addWidget(self.btn_run_monte_carlo)
         controls.addStretch(1)
@@ -576,6 +803,7 @@ class MainWindow(QMainWindow):
         return w
 
     def _connect_signals(self):
+        self.btn_add_joint_set.clicked.connect(self.on_add_joint_set)
         self.btn_run_primary.clicked.connect(self.on_run_primary)
         self.btn_save_prm.clicked.connect(self.on_save_prm)
         self.btn_run_secondary.clicked.connect(self.on_run_secondary)
@@ -603,17 +831,35 @@ class MainWindow(QMainWindow):
             density=self.density.value(),
         )
         sets = []
-        for i,(dip,dipr,dd,ddr,jc,s_min,s_mean,s_max) in enumerate(self.joint_widgets):
+        for idx, entry in enumerate(self.joint_widgets):
+            name_widget = entry.get("name")
+            name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+            if not name:
+                name = f"Set{idx + 1}"
+            dip = entry.get("dip")
+            dip_range = entry.get("dip_range")
+            dip_dir = entry.get("dip_dir")
+            dip_dir_range = entry.get("dip_dir_range")
+            jc = entry.get("jc")
+            s_min = entry.get("spacing_min")
+            s_mean = entry.get("spacing_mean")
+            s_max = entry.get("spacing_max")
             sets.append(JointSet(
-                name=f"Set{i+1}",
-                mean_dip=dip.value(),
-                dip_range=dipr.value(),
-                mean_dip_dir=dd.value(),
-                dip_dir_range=ddr.value(),
-                spacing=SpacingDist("trunc_exp", s_min.value(), s_mean.value(), s_max.value()),
-                JC=jc.value()
+                name=name,
+                mean_dip=dip.value() if isinstance(dip, QDoubleSpinBox) else 45.0,
+                dip_range=dip_range.value() if isinstance(dip_range, QDoubleSpinBox) else 10.0,
+                mean_dip_dir=dip_dir.value() if isinstance(dip_dir, QDoubleSpinBox) else 0.0,
+                dip_dir_range=dip_dir_range.value() if isinstance(dip_dir_range, QDoubleSpinBox) else 20.0,
+                spacing=SpacingDist(
+                    "trunc_exp",
+                    s_min.value() if isinstance(s_min, QDoubleSpinBox) else 0.3,
+                    s_mean.value() if isinstance(s_mean, QDoubleSpinBox) else 1.0,
+                    s_max.value() if isinstance(s_max, QDoubleSpinBox) else 3.0,
+                ),
+                JC=jc.value() if isinstance(jc, QSpinBox) else 20,
             ))
         self.joint_sets = sets
+        self._update_combination_controls()
         self.cave = CaveFace(
             dip=self.cave_dip.value(),
             dip_dir=self.cave_ddir.value(),
@@ -640,16 +886,32 @@ class MainWindow(QMainWindow):
             drawbell_lower_width=self.lower_w.value(),
         )
 
+    def on_add_joint_set(self):
+        js = JointSet(
+            name=f"Set{len(self.joint_widgets) + 1}",
+            mean_dip=45.0,
+            dip_range=10.0,
+            mean_dip_dir=0.0,
+            dip_dir_range=20.0,
+            spacing=SpacingDist("trunc_exp", 0.3, 1.0, 3.0),
+            JC=20,
+        )
+        self._add_joint_set_widget(js)
+
     def on_run_primary(self):
         self.update_models_from_ui()
         n = int(self.nblocks.value())
+        selected_sets = self._selected_joint_sets()
+        if len(selected_sets) < 3:
+            QMessageBox.warning(self, "Joint sets required", "Select three joint sets for the analysis.")
+            return
         self._last_secondary_stats = None
         self.plot_secondary.fig.clear()
         self.plot_secondary.canvas.draw_idle()
         self.plot_secondary.has_data = False
         self.btn_save_secondary_plot.setEnabled(False)
         def work():
-            blocks = generate_primary_blocks(n, self.rock, self.joint_sets, self.cave, self.defaults, seed=self.defaults.seed or 1234)
+            blocks = generate_primary_blocks(n, self.rock, selected_sets, self.cave, self.defaults, seed=self.defaults.seed or 1234)
             primary_fines_ratio = self.cave.spalling_pct/100.0
             out_path = os.path.join(os.getcwd(), "primary_output.prm")
             write_prm(out_path, self.rock, self.cave, blocks, primary_fines_ratio)
@@ -681,8 +943,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No primary blocks", "Run primary first.")
             return
         self.update_models_from_ui()
+        selected_sets = self._selected_joint_sets()
+        if len(selected_sets) < 3:
+            QMessageBox.warning(self, "Joint sets required", "Select three joint sets for the analysis.")
+            return
         def work():
-            mu = average_scatter_deg_from_jointsets(self.joint_sets)
+            mu = average_scatter_deg_from_jointsets(selected_sets)
             sec_blocks, sec_fines_ratio = run_secondary(self.primary_blocks, self.rock, self.secondary, self.defaults, mu_scatter_deg=mu, primary_fines_ratio=self.primary_fines_ratio)
             out_path = os.path.join(os.getcwd(), "secondary_output.sec")
             write_sec(out_path, self.rock, self.cave, sec_blocks, self.primary_fines_ratio)
@@ -730,18 +996,63 @@ class MainWindow(QMainWindow):
         nblocks = int(self.mc_blocks.value())
         variation = float(self.mc_variation.value())
 
-        self._last_monte_carlo_result = None
-        self._last_monte_carlo_inputs = {
+        if len(self.joint_sets) < 3:
+            QMessageBox.warning(self, "Joint sets required", "Define at least three joint sets before running Monte Carlo.")
+            return
+
+        selected_indexes = self._selected_joint_combination_indexes()
+        choice = self.combo_mc_combinations.currentData() if hasattr(self, "combo_mc_combinations") else ("geology", None)
+        if not isinstance(choice, tuple) or len(choice) != 2:
+            choice = ("geology", None)
+
+        available_combos = self._all_joint_combinations()
+        combos_to_run: List[Tuple[int, int, int]]
+        mode, data = choice
+        if mode == "combo" and data is not None:
+            combos_to_run = [tuple(data)]
+        elif mode == "all":
+            combos_to_run = available_combos
+        else:
+            if selected_indexes is None:
+                QMessageBox.warning(self, "Joint set selection", "Select three joint sets on the Geology tab to use for Monte Carlo.")
+                return
+            combos_to_run = [selected_indexes]
+
+        combos_to_run = [tuple(combo) for combo in combos_to_run if len(combo) == 3]
+        combos_to_run = [combo for combo in combos_to_run if all(0 <= idx < len(self.joint_sets) for idx in combo)]
+        combos_to_run = list(dict.fromkeys(combos_to_run))
+        if not combos_to_run:
+            QMessageBox.warning(self, "Joint set selection", "No valid joint-set combinations are available for Monte Carlo.")
+            return
+
+        names = [js.name for js in self.joint_sets]
+        combination_specs = [
+            {"indexes": combo, "label": self._combination_label(combo, names)}
+            for combo in combos_to_run
+        ]
+
+        total_runs = runs * len(combination_specs)
+        base_inputs = {
             "rock": asdict(self.rock),
             "joint_sets": [asdict(js) for js in self.joint_sets],
             "cave": asdict(self.cave),
             "defaults": asdict(self.defaults),
             "secondary": asdict(self.secondary),
+            "selected_combination": list(selected_indexes) if selected_indexes else None,
+            "joint_combinations": [
+                {"label": spec["label"], "indexes": list(spec["indexes"])} for spec in combination_specs
+            ],
         }
+
+        self._last_monte_carlo_result = None
+        self._last_monte_carlo_inputs = dict(base_inputs)
         self._last_monte_carlo_settings = {
             "runs": runs,
+            "total_runs": total_runs,
             "blocks_per_run": nblocks,
             "variation_pct": variation,
+            "combination_mode": self.combo_mc_combinations.currentText() if hasattr(self, "combo_mc_combinations") else "Geology selection",
+            "combinations": [spec["label"] for spec in combination_specs],
         }
         self.btn_save_mc_plot.setEnabled(False)
         self.btn_save_mc_report.setEnabled(False)
@@ -749,35 +1060,53 @@ class MainWindow(QMainWindow):
         self._refresh_monte_carlo_plot()
 
         def work():
-            primary_results = []
-            primary_avg_volumes = []
-            secondary_results = []
-            secondary_avg_volumes = []
-            max_workers = max(1, min(runs, os.cpu_count() or 4))
-            base_inputs = dict(self._last_monte_carlo_inputs or {})
+            primary_results: Dict[str, List[dict]] = defaultdict(list)
+            secondary_results: Dict[str, List[dict]] = defaultdict(list)
+            primary_avg_volumes: Dict[str, List[float]] = defaultdict(list)
+            secondary_avg_volumes: Dict[str, List[float]] = defaultdict(list)
+            combo_order: List[str] = []
 
-            def consume_result(primary_stats: dict, secondary_stats: dict):
-                primary_results.append(primary_stats)
-                primary_avg_volumes.append(primary_stats.get("avg_volume", 0.0))
-                secondary_results.append(secondary_stats)
-                secondary_avg_volumes.append(secondary_stats.get("avg_volume", 0.0))
+            max_workers = max(1, min(total_runs, os.cpu_count() or 4))
+            seeds = [random.randint(0, 10**9) for _ in range(total_runs)]
+            tasks = []
+            seed_idx = 0
+            for spec in combination_specs:
+                for _ in range(runs):
+                    tasks.append((seeds[seed_idx], spec))
+                    seed_idx += 1
 
-            seeds = [random.randint(0, 10**9) for _ in range(runs)]
+            def consume_result(label: str, primary_stats: dict, secondary_stats: dict):
+                if label not in combo_order:
+                    combo_order.append(label)
+                primary_results[label].append(primary_stats)
+                primary_avg_volumes[label].append(primary_stats.get("avg_volume", 0.0))
+                secondary_results[label].append(secondary_stats)
+                secondary_avg_volumes[label].append(secondary_stats.get("avg_volume", 0.0))
 
             if max_workers == 1:
-                for seed in seeds:
-                    primary_stats, sec_stats = _monte_carlo_worker(seed, nblocks, variation, base_inputs)
-                    consume_result(primary_stats, sec_stats)
+                for seed, spec in tasks:
+                    label, primary_stats, sec_stats = _monte_carlo_worker(
+                        seed, nblocks, variation, base_inputs, spec["indexes"], spec["label"]
+                    )
+                    consume_result(label, primary_stats, sec_stats)
             else:
                 try:
                     with ProcessPoolExecutor(max_workers=max_workers) as executor:
                         futures = [
-                            executor.submit(_monte_carlo_worker, seed, nblocks, variation, base_inputs)
-                            for seed in seeds
+                            executor.submit(
+                                _monte_carlo_worker,
+                                seed,
+                                nblocks,
+                                variation,
+                                base_inputs,
+                                spec["indexes"],
+                                spec["label"],
+                            )
+                            for seed, spec in tasks
                         ]
                         for fut in as_completed(futures):
-                            primary_stats, sec_stats = fut.result()
-                            consume_result(primary_stats, sec_stats)
+                            label, primary_stats, sec_stats = fut.result()
+                            consume_result(label, primary_stats, sec_stats)
                 except Exception as exc:
                     try:
                         self.sig.log.emit(f"Process pool failed ({exc}); falling back to threads.")
@@ -785,17 +1114,25 @@ class MainWindow(QMainWindow):
                         pass
                     with ThreadPoolExecutor(max_workers=max_workers) as executor:
                         futures = [
-                            executor.submit(_monte_carlo_worker, seed, nblocks, variation, base_inputs)
-                            for seed in seeds
+                            executor.submit(
+                                _monte_carlo_worker,
+                                seed,
+                                nblocks,
+                                variation,
+                                base_inputs,
+                                spec["indexes"],
+                                spec["label"],
+                            )
+                            for seed, spec in tasks
                         ]
                         for fut in as_completed(futures):
-                            primary_stats, sec_stats = fut.result()
-                            consume_result(primary_stats, sec_stats)
+                            label, primary_stats, sec_stats = fut.result()
+                            consume_result(label, primary_stats, sec_stats)
 
-            if not primary_results:
+            if not combo_order:
                 return
 
-            def envelope(stats_list):
+            def envelope(stats_list: List[dict]):
                 xs_local = [lo for lo, _ in stats_list[0]["bins"]]
                 cum_mass_runs = [stats["cum_mass"] for stats in stats_list]
                 avg_line_local = [statistics.mean(vals) for vals in zip(*cum_mass_runs)]
@@ -803,44 +1140,95 @@ class MainWindow(QMainWindow):
                 max_line_local = [max(vals) for vals in zip(*cum_mass_runs)]
                 return xs_local, avg_line_local, min_line_local, max_line_local
 
-            primary_xs, p_avg, p_min, p_max = envelope(primary_results)
-            if secondary_results:
-                secondary_xs, s_avg, s_min, s_max = envelope(secondary_results)
-            else:
-                secondary_xs, s_avg, s_min, s_max = [], [], [], []
+            multi_combo = len(combo_order) > 1
+            primary_series: List[Tuple[str, List[float]]] = []
+            primary_xs: List[float] = []
+            for label in combo_order:
+                stats_list = primary_results.get(label)
+                if not stats_list:
+                    continue
+                xs_local, avg_line, min_line, max_line = envelope(stats_list)
+                primary_xs = xs_local
+                if multi_combo:
+                    base = f"Primary cumulative mass ({label})"
+                    primary_series.append((f"{base} – average", avg_line))
+                    primary_series.append((f"{base} – minimum", min_line))
+                    primary_series.append((f"{base} – maximum", max_line))
+                else:
+                    primary_series = [
+                        ("Primary cumulative mass (average)", avg_line),
+                        ("Primary cumulative mass (minimum)", min_line),
+                        ("Primary cumulative mass (maximum)", max_line),
+                    ]
+                    break
+
+            secondary_series: List[Tuple[str, List[float]]] = []
+            secondary_xs: List[float] = []
+            for label in combo_order:
+                stats_list = secondary_results.get(label)
+                if not stats_list:
+                    continue
+                xs_local, avg_line, min_line, max_line = envelope(stats_list)
+                secondary_xs = xs_local
+                if multi_combo:
+                    base = f"Secondary cumulative mass ({label})"
+                    secondary_series.append((f"{base} – average", avg_line))
+                    secondary_series.append((f"{base} – minimum", min_line))
+                    secondary_series.append((f"{base} – maximum", max_line))
+                else:
+                    secondary_series = [
+                        ("Secondary cumulative mass (average)", avg_line),
+                        ("Secondary cumulative mass (minimum)", min_line),
+                        ("Secondary cumulative mass (maximum)", max_line),
+                    ]
+                    break
+
+            def summarize(values: List[float]) -> Dict[str, float]:
+                if not values:
+                    return {"mean_avg_volume": 0.0, "min_avg_volume": 0.0, "max_avg_volume": 0.0}
+                return {
+                    "mean_avg_volume": statistics.mean(values),
+                    "min_avg_volume": min(values),
+                    "max_avg_volume": max(values),
+                }
+
+            all_primary_avgs = [val for vals in primary_avg_volumes.values() for val in vals]
+            all_secondary_avgs = [val for vals in secondary_avg_volumes.values() for val in vals]
 
             info = {
-                "runs": runs,
+                "runs": total_runs,
                 "variation_pct": variation,
-                "primary": {
-                    "mean_avg_volume": statistics.mean(primary_avg_volumes) if primary_avg_volumes else 0.0,
-                    "min_avg_volume": min(primary_avg_volumes) if primary_avg_volumes else 0.0,
-                    "max_avg_volume": max(primary_avg_volumes) if primary_avg_volumes else 0.0,
-                },
-                "secondary": {
-                    "mean_avg_volume": statistics.mean(secondary_avg_volumes) if secondary_avg_volumes else 0.0,
-                    "min_avg_volume": min(secondary_avg_volumes) if secondary_avg_volumes else 0.0,
-                    "max_avg_volume": max(secondary_avg_volumes) if secondary_avg_volumes else 0.0,
-                },
+                "runs_per_combination": runs,
+                "primary": summarize(all_primary_avgs),
+                "secondary": summarize(all_secondary_avgs),
+                "combinations": [],
             }
+
+            for label in combo_order:
+                info["combinations"].append(
+                    {
+                        "label": label,
+                        "indexes": list(next((spec["indexes"] for spec in combination_specs if spec["label"] == label), ())),
+                        "runs": len(primary_avg_volumes.get(label, [])),
+                        "primary": summarize(primary_avg_volumes.get(label, [])),
+                        "secondary": summarize(secondary_avg_volumes.get(label, [])),
+                    }
+                )
+
             self.sig.done_monte_carlo.emit(
                 {
                     "primary": {
                         "xs": primary_xs,
-                        "series": [
-                            ("Primary cumulative mass (average)", p_avg),
-                            ("Primary cumulative mass (minimum)", p_min),
-                            ("Primary cumulative mass (maximum)", p_max),
-                        ],
+                        "series": primary_series,
                     },
-                    "secondary": {
-                        "xs": secondary_xs,
-                        "series": [
-                            ("Secondary cumulative mass (average)", s_avg),
-                            ("Secondary cumulative mass (minimum)", s_min),
-                            ("Secondary cumulative mass (maximum)", s_max),
-                        ],
-                    } if secondary_xs else None,
+                    "secondary": (
+                        {
+                            "xs": secondary_xs,
+                            "series": secondary_series,
+                        }
+                        if secondary_series
+                        else None
+                    ),
                     "info": info,
                 }
             )
@@ -858,7 +1246,16 @@ class MainWindow(QMainWindow):
         info = result.get("info", {})
         p_info = info.get("primary", {})
         s_info = info.get("secondary", {})
-        self.lbl_mc_stats.setText(
+        combos_info = info.get("combinations", [])
+        combos_summary = ""
+        if combos_info:
+            summary_parts = [f"{entry.get('label', 'Combo')} ({entry.get('runs', 0)} runs)" for entry in combos_info]
+            combos_summary = " | Combinations: " + "; ".join(summary_parts)
+            runs_per_combo = info.get("runs_per_combination")
+            if runs_per_combo and len(combos_info) > 1:
+                combos_summary += f" | Runs/combo: {runs_per_combo}"
+
+        summary_text = (
             "Monte Carlo runs: {runs} | Primary avg volume {p_mean:.2f} m³ (min {p_min:.2f}, max {p_max:.2f}) | "
             "Secondary avg volume {s_mean:.2f} m³ (min {s_min:.2f}, max {s_max:.2f}) | Variation ±{var:.1f}%".format(
                 runs=info.get("runs", 0),
@@ -871,6 +1268,7 @@ class MainWindow(QMainWindow):
                 var=info.get("variation_pct", 0.0),
             )
         )
+        self.lbl_mc_stats.setText(summary_text + combos_summary)
         self.btn_save_mc_report.setEnabled(True)
 
     def _refresh_all_plots(self):
@@ -1067,12 +1465,45 @@ class MainWindow(QMainWindow):
         secondary_row[3].text = f"{info.get('secondary', {}).get('max_avg_volume', 0.0):.3f}"
 
         doc.add_paragraph(
-            "Runs performed: {runs}  |  Blocks per run: {blocks}  |  Variation: ±{var:.1f}%".format(
+            "Runs per combination: {runs}  |  Total runs: {total}  |  Blocks per run: {blocks}  |  Variation: ±{var:.1f}%".format(
                 runs=self._last_monte_carlo_settings.get("runs", 0),
+                total=self._last_monte_carlo_settings.get("total_runs", self._last_monte_carlo_settings.get("runs", 0)),
                 blocks=self._last_monte_carlo_settings.get("blocks_per_run", 0),
                 var=self._last_monte_carlo_settings.get("variation_pct", 0.0),
             )
         )
+
+        combos_info = info.get("combinations", [])
+        if combos_info:
+            doc.add_heading("Joint set combinations", level=1)
+            combo_table = doc.add_table(rows=len(combos_info) + 1, cols=6)
+            headers = combo_table.rows[0].cells
+            headers[0].text = "Combination"
+            headers[1].text = "Indexes"
+            headers[2].text = "Runs"
+            headers[3].text = "Primary avg (m³)"
+            headers[4].text = "Secondary avg (m³)"
+            headers[5].text = "Ranges (m³)"
+            for row_idx, combo in enumerate(combos_info, start=1):
+                cells = combo_table.rows[row_idx].cells
+                cells[0].text = combo.get("label", "")
+                indexes = combo.get("indexes") or []
+                if indexes:
+                    cells[1].text = ", ".join(str(int(i) + 1) for i in indexes)
+                else:
+                    cells[1].text = "-"
+                cells[2].text = str(combo.get("runs", 0))
+                primary_stats = combo.get("primary", {})
+                secondary_stats = combo.get("secondary", {})
+                cells[3].text = f"{primary_stats.get('mean_avg_volume', 0.0):.3f}"
+                cells[4].text = f"{secondary_stats.get('mean_avg_volume', 0.0):.3f}"
+                p_min = primary_stats.get("min_avg_volume", 0.0)
+                p_max = primary_stats.get("max_avg_volume", 0.0)
+                s_min = secondary_stats.get("min_avg_volume", 0.0)
+                s_max = secondary_stats.get("max_avg_volume", 0.0)
+                cells[5].text = (
+                    f"Primary: {p_min:.3f}–{p_max:.3f}; Secondary: {s_min:.3f}–{s_max:.3f}"
+                )
 
         doc.add_heading("Simulation settings", level=1)
         settings_table = doc.add_table(rows=len(self._last_monte_carlo_settings) + 1, cols=2)
