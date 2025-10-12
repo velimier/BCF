@@ -487,6 +487,8 @@ class MainWindow(QMainWindow):
         self._last_monte_carlo_settings: dict | None = None
         self._last_primary_stats: dict | None = None
         self._last_secondary_stats: dict | None = None
+        self._mc_stop_event: threading.Event | None = None
+        self._mc_thread: threading.Thread | None = None
 
         self._legend_enabled = True
         self._mc_use_shaded_envelope = False
@@ -1027,8 +1029,13 @@ class MainWindow(QMainWindow):
         controls.addWidget(QLabel("Joint set combinations"))
         self.combo_mc_combinations = QComboBox()
         controls.addWidget(self.combo_mc_combinations)
+        btn_run_row = QHBoxLayout()
         self.btn_run_monte_carlo = QPushButton("Run Monte Carlo")
-        controls.addWidget(self.btn_run_monte_carlo)
+        btn_run_row.addWidget(self.btn_run_monte_carlo)
+        self.btn_stop_monte_carlo = QPushButton("Stop")
+        self.btn_stop_monte_carlo.setEnabled(False)
+        btn_run_row.addWidget(self.btn_stop_monte_carlo)
+        controls.addLayout(btn_run_row)
         controls.addStretch(1)
 
         layout.addLayout(controls, 0)
@@ -1234,6 +1241,7 @@ class MainWindow(QMainWindow):
         self.btn_save_primary_plot.clicked.connect(lambda: self.plot_primary.save_dialog(self, "primary_distribution.png"))
         self.btn_save_secondary_plot.clicked.connect(lambda: self.plot_secondary.save_dialog(self, "secondary_distribution.png"))
         self.btn_run_monte_carlo.clicked.connect(self.on_run_monte_carlo)
+        self.btn_stop_monte_carlo.clicked.connect(self.on_stop_monte_carlo)
         self.btn_save_mc_plot.clicked.connect(lambda: self.plot_monte_carlo.save_dialog(self, "monte_carlo.png"))
         self.btn_save_mc_report.clicked.connect(self.on_save_monte_carlo_report)
         self.chk_show_primary.toggled.connect(self._refresh_monte_carlo_plot)
@@ -1909,6 +1917,9 @@ class MainWindow(QMainWindow):
             progress.setValue(0)
             progress.setFormat(f"0/{total_runs} runs" if total_runs else "Monte Carlo idle")
         self.btn_run_monte_carlo.setEnabled(False)
+        self.btn_stop_monte_carlo.setEnabled(True)
+        stop_event = threading.Event()
+        self._mc_stop_event = stop_event
 
         def work():
             primary_results: Dict[str, List[dict]] = defaultdict(list)
@@ -1930,6 +1941,8 @@ class MainWindow(QMainWindow):
 
             def consume_result(label: str, primary_stats: dict, secondary_stats: dict):
                 nonlocal completed_runs
+                if stop_event.is_set():
+                    return
                 if label not in combo_order:
                     combo_order.append(label)
                 primary_results[label].append(primary_stats)
@@ -1944,52 +1957,87 @@ class MainWindow(QMainWindow):
 
             if max_workers == 1:
                 for seed, spec in tasks:
+                    if stop_event.is_set():
+                        break
                     label, primary_stats, sec_stats = _monte_carlo_worker(
                         seed, nblocks, variation, base_inputs, spec["indexes"], spec["label"]
                     )
                     consume_result(label, primary_stats, sec_stats)
+                    if stop_event.is_set():
+                        break
             else:
                 try:
-                    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                        futures = [
-                            executor.submit(
-                                _monte_carlo_worker,
-                                seed,
-                                nblocks,
-                                variation,
-                                base_inputs,
-                                spec["indexes"],
-                                spec["label"],
-                            )
-                            for seed, spec in tasks
-                        ]
+                    executor: ProcessPoolExecutor | None = None
+                    futures: List = []
+                    executor = ProcessPoolExecutor(max_workers=max_workers)
+                    futures = [
+                        executor.submit(
+                            _monte_carlo_worker,
+                            seed,
+                            nblocks,
+                            variation,
+                            base_inputs,
+                            spec["indexes"],
+                            spec["label"],
+                        )
+                        for seed, spec in tasks
+                    ]
+                    try:
                         for fut in as_completed(futures):
+                            if stop_event.is_set():
+                                break
                             label, primary_stats, sec_stats = fut.result()
+                            if stop_event.is_set():
+                                break
                             consume_result(label, primary_stats, sec_stats)
+                    finally:
+                        cancel_pending = stop_event.is_set()
+                        if cancel_pending:
+                            for fut in futures:
+                                fut.cancel()
+                        if executor is not None:
+                            try:
+                                executor.shutdown(cancel_futures=cancel_pending)
+                            except TypeError:  # pragma: no cover - backwards compatibility
+                                executor.shutdown()
                 except Exception as exc:
                     try:
                         self.sig.log.emit(f"Process pool failed ({exc}); falling back to threads.")
                     except Exception:  # pragma: no cover - logging is best effort
                         pass
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                        futures = [
-                            executor.submit(
-                                _monte_carlo_worker,
-                                seed,
-                                nblocks,
-                                variation,
-                                base_inputs,
-                                spec["indexes"],
-                                spec["label"],
-                            )
-                            for seed, spec in tasks
-                        ]
+                    executor = ThreadPoolExecutor(max_workers=max_workers)
+                    futures = [
+                        executor.submit(
+                            _monte_carlo_worker,
+                            seed,
+                            nblocks,
+                            variation,
+                            base_inputs,
+                            spec["indexes"],
+                            spec["label"],
+                        )
+                        for seed, spec in tasks
+                    ]
+                    try:
                         for fut in as_completed(futures):
+                            if stop_event.is_set():
+                                break
                             label, primary_stats, sec_stats = fut.result()
+                            if stop_event.is_set():
+                                break
                             consume_result(label, primary_stats, sec_stats)
+                    finally:
+                        cancel_pending = stop_event.is_set()
+                        if cancel_pending:
+                            for fut in futures:
+                                fut.cancel()
+                        try:
+                            executor.shutdown(cancel_futures=cancel_pending)
+                        except TypeError:  # pragma: no cover - backwards compatibility
+                            executor.shutdown()
 
-            if not combo_order:
-                return
+            requested_runs = total_runs
+            stop_requested = stop_event.is_set()
 
             def envelope(stats_list: List[dict]):
                 xs_local = [lo for lo, _ in stats_list[0]["bins"]]
@@ -2071,12 +2119,14 @@ class MainWindow(QMainWindow):
             all_secondary_avgs = [val for vals in secondary_avg_volumes.values() for val in vals]
 
             info = {
-                "runs": total_runs,
+                "runs": completed_runs,
+                "requested_runs": requested_runs,
                 "variation_pct": variation,
                 "runs_per_combination": runs,
                 "primary": summarize(all_primary_avgs),
                 "secondary": summarize(all_secondary_avgs),
                 "combinations": [],
+                "stopped": bool(stop_requested and completed_runs < requested_runs),
             }
 
             for label in combo_order:
@@ -2110,11 +2160,33 @@ class MainWindow(QMainWindow):
                 }
             )
 
-        threading.Thread(target=work, daemon=True).start()
+        thread = threading.Thread(target=work, daemon=True)
+        self._mc_thread = thread
+        thread.start()
+
+    def on_stop_monte_carlo(self):
+        event = getattr(self, "_mc_stop_event", None)
+        if isinstance(event, threading.Event):
+            event.set()
+        if hasattr(self, "btn_stop_monte_carlo"):
+            self.btn_stop_monte_carlo.setEnabled(False)
+        progress = getattr(self, "mc_progress", None)
+        if isinstance(progress, QProgressBar):
+            progress.setVisible(True)
+            total = progress.maximum()
+            current = progress.value()
+            if total > 0:
+                progress.setFormat(f"{current}/{total} runs (stopping)")
+            else:
+                progress.setFormat("Monte Carlo stopping…")
+        if hasattr(self, "lbl_mc_stats"):
+            self.lbl_mc_stats.setText("Monte Carlo: stopping…")
 
     def on_done_monte_carlo(self, result: dict):
         self._last_monte_carlo_result = result
         self.btn_run_monte_carlo.setEnabled(True)
+        if hasattr(self, "btn_stop_monte_carlo"):
+            self.btn_stop_monte_carlo.setEnabled(False)
         labels = []
         for key in ("primary", "secondary"):
             series = (result.get(key) or {}).get("series") or []
@@ -2125,6 +2197,9 @@ class MainWindow(QMainWindow):
         p_info = info.get("primary", {})
         s_info = info.get("secondary", {})
         combos_info = info.get("combinations", [])
+        requested_runs = info.get("requested_runs")
+        completed_runs = info.get("runs", 0)
+        stopped = bool(info.get("stopped"))
         combos_summary = ""
         if combos_info:
             summary_parts = [f"{entry.get('label', 'Combo')} ({entry.get('runs', 0)} runs)" for entry in combos_info]
@@ -2133,32 +2208,54 @@ class MainWindow(QMainWindow):
             if runs_per_combo and len(combos_info) > 1:
                 combos_summary += f" | Runs/combo: {runs_per_combo}"
 
+        run_summary = f"Monte Carlo runs: {completed_runs}"
+        if requested_runs:
+            run_summary += f" of {requested_runs}"
+        if stopped and (not requested_runs or completed_runs < requested_runs):
+            run_summary += " (stopped)"
+
         summary_text = (
-            "Monte Carlo runs: {runs} | Primary avg volume {p_mean:.2f} m³ (min {p_min:.2f}, max {p_max:.2f}) | "
-            "Secondary avg volume {s_mean:.2f} m³ (min {s_min:.2f}, max {s_max:.2f}) | Variation ±{var:.1f}%".format(
-                runs=info.get("runs", 0),
-                p_mean=p_info.get("mean_avg_volume", 0.0),
-                p_min=p_info.get("min_avg_volume", 0.0),
-                p_max=p_info.get("max_avg_volume", 0.0),
-                s_mean=s_info.get("mean_avg_volume", 0.0),
-                s_min=s_info.get("min_avg_volume", 0.0),
-                s_max=s_info.get("max_avg_volume", 0.0),
-                var=info.get("variation_pct", 0.0),
-            )
+            f"{run_summary} | Primary avg volume {p_info.get('mean_avg_volume', 0.0):.2f} m³ (min "
+            f"{p_info.get('min_avg_volume', 0.0):.2f}, max {p_info.get('max_avg_volume', 0.0):.2f}) | "
+            f"Secondary avg volume {s_info.get('mean_avg_volume', 0.0):.2f} m³ (min {s_info.get('min_avg_volume', 0.0):.2f}, "
+            f"max {s_info.get('max_avg_volume', 0.0):.2f}) | Variation ±{info.get('variation_pct', 0.0):.1f}%"
         )
         self.lbl_mc_stats.setText(summary_text + combos_summary)
         progress = getattr(self, "mc_progress", None)
         if isinstance(progress, QProgressBar):
-            total_runs = info.get("runs") or 0
-            total_runs = int(total_runs)
-            if total_runs <= 0:
+            total_runs = requested_runs if requested_runs is not None else completed_runs
+            try:
+                total_runs_int = int(total_runs)
+            except (TypeError, ValueError):
+                total_runs_int = 0
+            try:
+                completed_int = int(completed_runs)
+            except (TypeError, ValueError):
+                completed_int = 0
+            if total_runs_int > 0:
+                completed_int = max(0, min(completed_int, total_runs_int))
+            else:
+                completed_int = max(0, completed_int)
+            if total_runs_int <= 0:
                 progress.setRange(0, 1)
                 progress.setValue(0)
                 progress.setFormat("Monte Carlo idle")
+                progress.setVisible(False)
             else:
-                progress.setRange(0, total_runs)
-                progress.setValue(total_runs)
-                progress.setFormat(f"Completed {total_runs}/{total_runs} runs")
+                progress.setRange(0, total_runs_int)
+                progress.setValue(completed_int)
+                if stopped and completed_int < total_runs_int:
+                    progress.setFormat(f"Stopped at {completed_int}/{total_runs_int} runs")
+                else:
+                    progress.setFormat(f"Completed {completed_int}/{total_runs_int} runs")
+                progress.setVisible(True)
+        if isinstance(self._last_monte_carlo_settings, dict):
+            self._last_monte_carlo_settings["completed_runs"] = completed_runs
+            if requested_runs is not None:
+                self._last_monte_carlo_settings["total_runs"] = requested_runs
+            self._last_monte_carlo_settings["stopped"] = stopped
+        self._mc_stop_event = None
+        self._mc_thread = None
         self.btn_save_mc_report.setEnabled(True)
 
     def on_monte_carlo_progress(self, completed: int, total: int):
@@ -2174,11 +2271,17 @@ class MainWindow(QMainWindow):
             progress.setVisible(False)
             return
         progress.setRange(0, total)
-        progress.setValue(min(completed, total))
-        progress.setFormat(f"{min(completed, total)}/{total} runs")
+        capped_completed = min(completed, total)
+        progress.setValue(capped_completed)
+        if self._mc_stop_event and isinstance(self._mc_stop_event, threading.Event) and self._mc_stop_event.is_set() and capped_completed < total:
+            progress.setFormat(f"{capped_completed}/{total} runs (stopping)")
+        else:
+            progress.setFormat(f"{capped_completed}/{total} runs")
         progress.setVisible(True)
         if total > 0 and completed >= total:
             self.btn_run_monte_carlo.setEnabled(True)
+            if hasattr(self, "btn_stop_monte_carlo"):
+                self.btn_stop_monte_carlo.setEnabled(False)
 
     def _refresh_all_plots(self):
         self._apply_chart_appearance_to_plots()
