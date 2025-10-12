@@ -778,6 +778,8 @@ class MainWindow(QMainWindow):
         self.rock_type = QLineEdit(self.rock.rock_type); self._set_uniform_input_width(self.rock_type); g.addWidget(QLabel("Rock type"), row,0); g.addWidget(self.rock_type,row,1); row+=1
         self.mrmr = QDoubleSpinBox(); self.mrmr.setRange(0,100); self.mrmr.setValue(self.rock.MRMR); self._set_uniform_input_width(self.mrmr); g.addWidget(QLabel("MRMR"), row,0); g.addWidget(self.mrmr,row,1); row+=1
         self.irs = QDoubleSpinBox(); self.irs.setRange(1,500); self.irs.setValue(self.rock.IRS); self._set_uniform_input_width(self.irs); g.addWidget(QLabel("IRS (MPa)"), row,0); g.addWidget(self.irs,row,1); row+=1
+        self.ibs = QDoubleSpinBox(); self.ibs.setRange(0,500); self.ibs.setDecimals(2); self.ibs.setSpecialValueText("Auto (calculated)");
+        self.ibs.setValue(self.rock.IBS if self.rock.IBS is not None else self.ibs.minimum()); self._set_uniform_input_width(self.ibs); g.addWidget(QLabel("IBS (MPa)"), row,0); g.addWidget(self.ibs,row,1); row+=1
         self.mi = QDoubleSpinBox(); self.mi.setRange(1,50); self.mi.setValue(self.rock.mi); self._set_uniform_input_width(self.mi); g.addWidget(QLabel("mi (Hoek–Brown)"), row,0); g.addWidget(self.mi,row,1); row+=1
         self.ff = QDoubleSpinBox(); self.ff.setRange(0,20); self.ff.setDecimals(2); self.ff.setValue(self.rock.frac_freq); self._set_uniform_input_width(self.ff); g.addWidget(QLabel("Fracture/veinlet freq (1/m)"), row,0); g.addWidget(self.ff,row,1); row+=1
         self.fc = QSpinBox(); self.fc.setRange(0,40); self.fc.setValue(self.rock.frac_condition); self._set_uniform_input_width(self.fc); g.addWidget(QLabel("Fracture/veinlet condition (0–40)"), row,0); g.addWidget(self.fc,row,1); row+=1
@@ -1109,6 +1111,7 @@ class MainWindow(QMainWindow):
             rock_type=self.rock_type.text() or "Unknown",
             MRMR=self.mrmr.value(),
             IRS=self.irs.value(),
+            IBS=self._gather_ibs_value(),
             mi=self.mi.value(),
             frac_freq=self.ff.value(),
             frac_condition=self.fc.value(),
@@ -1286,6 +1289,7 @@ class MainWindow(QMainWindow):
         self.rock_type.setText(self.rock.rock_type)
         self.mrmr.setValue(self.rock.MRMR)
         self.irs.setValue(self.rock.IRS)
+        self._apply_ibs_value(self.rock.IBS)
         self.mi.setValue(self.rock.mi)
         self.ff.setValue(self.rock.frac_freq)
         self.fc.setValue(self.rock.frac_condition)
@@ -1317,6 +1321,28 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "nblocks"):
             self.nblocks.setValue(max(100, int(self.nblocks.value())))
+
+    def _gather_ibs_value(self) -> Optional[float]:
+        widget = getattr(self, "ibs", None)
+        if not isinstance(widget, QDoubleSpinBox):
+            return None
+        value = widget.value()
+        if widget.specialValueText() and value <= widget.minimum():
+            return None
+        return value
+
+    def _apply_ibs_value(self, value: Optional[float]):
+        widget = getattr(self, "ibs", None)
+        if not isinstance(widget, QDoubleSpinBox):
+            return
+        prev = widget.blockSignals(True)
+        if value is None and widget.specialValueText():
+            widget.setValue(widget.minimum())
+        elif value is not None:
+            widget.setValue(value)
+        else:
+            widget.setValue(widget.minimum())
+        widget.blockSignals(prev)
 
     def _apply_settings_state(self, state: dict):
         rock_data = state.get("rock")
