@@ -472,7 +472,7 @@ class MainWindow(QMainWindow):
 
         controls = QVBoxLayout()
         controls.addWidget(QLabel("<b>Monte Carlo simulation</b>"))
-        self.mc_runs = QSpinBox(); self.mc_runs.setRange(1, 1000); self.mc_runs.setValue(10)
+        self.mc_runs = QSpinBox(); self.mc_runs.setRange(1, 10000); self.mc_runs.setValue(10)
         controls.addWidget(QLabel("Number of runs")); controls.addWidget(self.mc_runs)
         self.mc_blocks = QSpinBox(); self.mc_blocks.setRange(100, 50000); self.mc_blocks.setValue(5000)
         controls.addWidget(QLabel("Blocks per run")); controls.addWidget(self.mc_blocks)
