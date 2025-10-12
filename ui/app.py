@@ -49,13 +49,21 @@ class PlotWidget(QWidget):
         self.canvas.draw_idle()
         self.has_data = True
 
-    def plot_lines(self, xs: List[float], ys_list: List[List[float]], labels: List[str] | None = None,
+    def plot_lines(self, xs: List[float] | List[List[float]], ys_list: List[List[float]], labels: List[str] | None = None,
                    title: str = "", xlabel: str = "", ylabel: str = "", logx: bool = False):
         self.fig.clear()
         ax = self.fig.add_subplot(111)
+        if ys_list:
+            if isinstance(xs, list) and xs and isinstance(xs[0], (list, tuple)):
+                xs_list = list(xs)
+            else:
+                xs_list = [xs] * len(ys_list)
+        else:
+            xs_list = []
         for i, ys in enumerate(ys_list):
             label = labels[i] if labels and i < len(labels) else None
-            ax.plot(xs, ys, label=label)
+            cur_xs = xs_list[i] if i < len(xs_list) else xs_list[0] if xs_list else []
+            ax.plot(cur_xs, ys, label=label)
         if logx:
             ax.set_xscale("log")
         ax.set_xlabel(xlabel)
@@ -86,7 +94,7 @@ class AppSignals(QObject):
     done_primary = Signal(list, float, str)
     done_secondary = Signal(list, float, str)
     done_hangup = Signal(dict)
-    done_monte_carlo = Signal(list, list, list, dict)
+    done_monte_carlo = Signal(dict)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -115,6 +123,10 @@ class MainWindow(QMainWindow):
         self._build_tabs()
         self._connect_signals()
 
+    def _set_uniform_input_width(self, widget):
+        widget.setMinimumWidth(140)
+        widget.setMaximumWidth(220)
+
     def _build_tabs(self):
         self.tabs.addTab(self._build_geology_tab(), "Geology")
         self.tabs.addTab(self._build_cave_tab(), "Cave")
@@ -126,26 +138,26 @@ class MainWindow(QMainWindow):
     def _build_geology_tab(self):
         w = QWidget(); g = QGridLayout(w)
         row = 0; g.addWidget(QLabel("<b>Rock mass</b>"), row,0,1,2); row+=1
-        self.rock_type = QLineEdit(self.rock.rock_type); g.addWidget(QLabel("Rock type"), row,0); g.addWidget(self.rock_type,row,1); row+=1
-        self.mrmr = QDoubleSpinBox(); self.mrmr.setRange(0,100); self.mrmr.setValue(self.rock.MRMR); g.addWidget(QLabel("MRMR"), row,0); g.addWidget(self.mrmr,row,1); row+=1
-        self.irs = QDoubleSpinBox(); self.irs.setRange(1,500); self.irs.setValue(self.rock.IRS); g.addWidget(QLabel("IRS (MPa)"), row,0); g.addWidget(self.irs,row,1); row+=1
-        self.mi = QDoubleSpinBox(); self.mi.setRange(1,50); self.mi.setValue(self.rock.mi); g.addWidget(QLabel("mi (Hoek–Brown)"), row,0); g.addWidget(self.mi,row,1); row+=1
-        self.ff = QDoubleSpinBox(); self.ff.setRange(0,20); self.ff.setDecimals(2); self.ff.setValue(self.rock.frac_freq); g.addWidget(QLabel("Fracture/veinlet freq (1/m)"), row,0); g.addWidget(self.ff,row,1); row+=1
-        self.fc = QSpinBox(); self.fc.setRange(0,40); self.fc.setValue(self.rock.frac_condition); g.addWidget(QLabel("Fracture/veinlet condition (0–40)"), row,0); g.addWidget(self.fc,row,1); row+=1
-        self.density = QDoubleSpinBox(); self.density.setRange(1500,4500); self.density.setValue(self.rock.density); g.addWidget(QLabel("Density (kg/m³)"), row,0); g.addWidget(self.density,row,1); row+=1
+        self.rock_type = QLineEdit(self.rock.rock_type); self._set_uniform_input_width(self.rock_type); g.addWidget(QLabel("Rock type"), row,0); g.addWidget(self.rock_type,row,1); row+=1
+        self.mrmr = QDoubleSpinBox(); self.mrmr.setRange(0,100); self.mrmr.setValue(self.rock.MRMR); self._set_uniform_input_width(self.mrmr); g.addWidget(QLabel("MRMR"), row,0); g.addWidget(self.mrmr,row,1); row+=1
+        self.irs = QDoubleSpinBox(); self.irs.setRange(1,500); self.irs.setValue(self.rock.IRS); self._set_uniform_input_width(self.irs); g.addWidget(QLabel("IRS (MPa)"), row,0); g.addWidget(self.irs,row,1); row+=1
+        self.mi = QDoubleSpinBox(); self.mi.setRange(1,50); self.mi.setValue(self.rock.mi); self._set_uniform_input_width(self.mi); g.addWidget(QLabel("mi (Hoek–Brown)"), row,0); g.addWidget(self.mi,row,1); row+=1
+        self.ff = QDoubleSpinBox(); self.ff.setRange(0,20); self.ff.setDecimals(2); self.ff.setValue(self.rock.frac_freq); self._set_uniform_input_width(self.ff); g.addWidget(QLabel("Fracture/veinlet freq (1/m)"), row,0); g.addWidget(self.ff,row,1); row+=1
+        self.fc = QSpinBox(); self.fc.setRange(0,40); self.fc.setValue(self.rock.frac_condition); self._set_uniform_input_width(self.fc); g.addWidget(QLabel("Fracture/veinlet condition (0–40)"), row,0); g.addWidget(self.fc,row,1); row+=1
+        self.density = QDoubleSpinBox(); self.density.setRange(1500,4500); self.density.setValue(self.rock.density); self._set_uniform_input_width(self.density); g.addWidget(QLabel("Density (kg/m³)"), row,0); g.addWidget(self.density,row,1); row+=1
 
         row+=1; g.addWidget(QLabel("<b>Joint sets</b>"), row,0,1,2); row+=1
         self.joint_widgets = []
         for i,js in enumerate(self.joint_sets):
             g.addWidget(QLabel(f"<u>{js.name}</u>"), row,0,1,2); row+=1
-            dip = QDoubleSpinBox(); dip.setRange(0,90); dip.setValue(js.mean_dip)
-            dipr= QDoubleSpinBox(); dipr.setRange(0,90); dipr.setValue(js.dip_range)
-            dd  = QDoubleSpinBox(); dd.setRange(0,360); dd.setValue(js.mean_dip_dir)
-            ddr = QDoubleSpinBox(); ddr.setRange(0,180); ddr.setValue(js.dip_dir_range)
-            jc  = QSpinBox(); jc.setRange(0,40); jc.setValue(js.JC)
-            s_min=QDoubleSpinBox(); s_min.setRange(0.01,50); s_min.setDecimals(2); s_min.setValue(js.spacing.min)
-            s_mean=QDoubleSpinBox(); s_mean.setRange(0.02,50); s_mean.setDecimals(2); s_mean.setValue(js.spacing.mean)
-            s_max=QDoubleSpinBox(); s_max.setRange(0.03,200); s_max.setDecimals(2); s_max.setValue(js.spacing.max_or_90pct)
+            dip = QDoubleSpinBox(); dip.setRange(0,90); dip.setValue(js.mean_dip); self._set_uniform_input_width(dip)
+            dipr= QDoubleSpinBox(); dipr.setRange(0,90); dipr.setValue(js.dip_range); self._set_uniform_input_width(dipr)
+            dd  = QDoubleSpinBox(); dd.setRange(0,360); dd.setValue(js.mean_dip_dir); self._set_uniform_input_width(dd)
+            ddr = QDoubleSpinBox(); ddr.setRange(0,180); ddr.setValue(js.dip_dir_range); self._set_uniform_input_width(ddr)
+            jc  = QSpinBox(); jc.setRange(0,40); jc.setValue(js.JC); self._set_uniform_input_width(jc)
+            s_min=QDoubleSpinBox(); s_min.setRange(0.01,50); s_min.setDecimals(2); s_min.setValue(js.spacing.min); self._set_uniform_input_width(s_min)
+            s_mean=QDoubleSpinBox(); s_mean.setRange(0.02,50); s_mean.setDecimals(2); s_mean.setValue(js.spacing.mean); self._set_uniform_input_width(s_mean)
+            s_max=QDoubleSpinBox(); s_max.setRange(0.03,200); s_max.setDecimals(2); s_max.setValue(js.spacing.max_or_90pct); self._set_uniform_input_width(s_max)
 
             g.addWidget(QLabel("Dip / Range"), row,0); g.addWidget(dip,row,1); g.addWidget(dipr,row,2); row+=1
             g.addWidget(QLabel("Dip dir / Range"), row,0); g.addWidget(dd,row,1); g.addWidget(ddr,row,2); row+=1
@@ -160,13 +172,13 @@ class MainWindow(QMainWindow):
     def _build_cave_tab(self):
         w = QWidget(); g = QGridLayout(w)
         row=0; g.addWidget(QLabel("<b>Cave face & stresses</b>"), row,0,1,2); row+=1
-        self.cave_dip = QDoubleSpinBox(); self.cave_dip.setRange(0,90); self.cave_dip.setValue(self.cave.dip); g.addWidget(QLabel("Face dip (°)"), row,0); g.addWidget(self.cave_dip,row,1); row+=1
-        self.cave_ddir = QDoubleSpinBox(); self.cave_ddir.setRange(0,360); self.cave_ddir.setValue(self.cave.dip_dir); g.addWidget(QLabel("Face dip direction (°)"), row,0); g.addWidget(self.cave_ddir,row,1); row+=1
-        self.st_dip = QDoubleSpinBox(); self.st_dip.setRange(0,100); self.st_dip.setValue(self.cave.stress_dip); g.addWidget(QLabel("Dip stress (MPa)"), row,0); g.addWidget(self.st_dip,row,1); row+=1
-        self.st_strike = QDoubleSpinBox(); self.st_strike.setRange(0,100); self.st_strike.setValue(self.cave.stress_strike); g.addWidget(QLabel("Strike stress (MPa)"), row,0); g.addWidget(self.st_strike,row,1); row+=1
-        self.st_norm = QDoubleSpinBox(); self.st_norm.setRange(0,100); self.st_norm.setValue(self.cave.stress_normal); g.addWidget(QLabel("Normal stress (MPa)"), row,0); g.addWidget(self.st_norm,row,1); row+=1
+        self.cave_dip = QDoubleSpinBox(); self.cave_dip.setRange(0,90); self.cave_dip.setValue(self.cave.dip); self._set_uniform_input_width(self.cave_dip); g.addWidget(QLabel("Face dip (°)"), row,0); g.addWidget(self.cave_dip,row,1); row+=1
+        self.cave_ddir = QDoubleSpinBox(); self.cave_ddir.setRange(0,360); self.cave_ddir.setValue(self.cave.dip_dir); self._set_uniform_input_width(self.cave_ddir); g.addWidget(QLabel("Face dip direction (°)"), row,0); g.addWidget(self.cave_ddir,row,1); row+=1
+        self.st_dip = QDoubleSpinBox(); self.st_dip.setRange(0,100); self.st_dip.setValue(self.cave.stress_dip); self._set_uniform_input_width(self.st_dip); g.addWidget(QLabel("Dip stress (MPa)"), row,0); g.addWidget(self.st_dip,row,1); row+=1
+        self.st_strike = QDoubleSpinBox(); self.st_strike.setRange(0,100); self.st_strike.setValue(self.cave.stress_strike); self._set_uniform_input_width(self.st_strike); g.addWidget(QLabel("Strike stress (MPa)"), row,0); g.addWidget(self.st_strike,row,1); row+=1
+        self.st_norm = QDoubleSpinBox(); self.st_norm.setRange(0,100); self.st_norm.setValue(self.cave.stress_normal); self._set_uniform_input_width(self.st_norm); g.addWidget(QLabel("Normal stress (MPa)"), row,0); g.addWidget(self.st_norm,row,1); row+=1
         self.allow_sf = QCheckBox("Allow stress fractures"); self.allow_sf.setChecked(self.cave.allow_stress_fractures); g.addWidget(self.allow_sf,row,0,1,2); row+=1
-        self.spalling = QDoubleSpinBox(); self.spalling.setRange(0,100); self.spalling.setDecimals(1); self.spalling.setValue(self.cave.spalling_pct); g.addWidget(QLabel("% spalling as fines"), row,0); g.addWidget(self.spalling,row,1); row+=1
+        self.spalling = QDoubleSpinBox(); self.spalling.setRange(0,100); self.spalling.setDecimals(1); self.spalling.setValue(self.cave.spalling_pct); self._set_uniform_input_width(self.spalling); g.addWidget(QLabel("% spalling as fines"), row,0); g.addWidget(self.spalling,row,1); row+=1
         return w
 
     def _build_primary_tab(self):
@@ -252,7 +264,7 @@ class MainWindow(QMainWindow):
 
         controls = QVBoxLayout()
         controls.addWidget(QLabel("<b>Monte Carlo simulation</b>"))
-        self.mc_runs = QSpinBox(); self.mc_runs.setRange(1, 100); self.mc_runs.setValue(10)
+        self.mc_runs = QSpinBox(); self.mc_runs.setRange(1, 1000); self.mc_runs.setValue(10)
         controls.addWidget(QLabel("Number of runs")); controls.addWidget(self.mc_runs)
         self.mc_blocks = QSpinBox(); self.mc_blocks.setRange(100, 50000); self.mc_blocks.setValue(5000)
         controls.addWidget(QLabel("Blocks per run")); controls.addWidget(self.mc_blocks)
@@ -282,10 +294,10 @@ class MainWindow(QMainWindow):
     def _build_defaults_tab(self):
         w = QWidget(); g = QGridLayout(w)
         row=0; g.addWidget(QLabel("<b>Defaults</b>"), row,0,1,2); row+=1
-        self.lhd_cutoff = QDoubleSpinBox(); self.lhd_cutoff.setRange(0.1,50); self.lhd_cutoff.setValue(self.defaults.LHD_cutoff_m3); g.addWidget(QLabel("LHD bucket cutoff (m³)"), row,0); g.addWidget(self.lhd_cutoff,row,1); row+=1
-        self.seed = QSpinBox(); self.seed.setRange(0,10**9); self.seed.setValue(self.defaults.seed or 1234); g.addWidget(QLabel("Random seed"), row,0); g.addWidget(self.seed,row,1); row+=1
-        self.arching_pct = QDoubleSpinBox(); self.arching_pct.setRange(0,1); self.arching_pct.setSingleStep(0.01); self.arching_pct.setValue(self.defaults.arching_pct); g.addWidget(QLabel("Arching split fraction (0–1)"), row,0); g.addWidget(self.arching_pct,row,1); row+=1
-        self.arch_factor = QDoubleSpinBox(); self.arch_factor.setRange(1,100); self.arch_factor.setValue(self.defaults.arch_stress_conc); g.addWidget(QLabel("Arch stress factor (× cave pressure)"), row,0); g.addWidget(self.arch_factor,row,1); row+=1
+        self.lhd_cutoff = QDoubleSpinBox(); self.lhd_cutoff.setRange(0.1,50); self.lhd_cutoff.setValue(self.defaults.LHD_cutoff_m3); self._set_uniform_input_width(self.lhd_cutoff); g.addWidget(QLabel("LHD bucket cutoff (m³)"), row,0); g.addWidget(self.lhd_cutoff,row,1); row+=1
+        self.seed = QSpinBox(); self.seed.setRange(0,10**9); self.seed.setValue(self.defaults.seed or 1234); self._set_uniform_input_width(self.seed); g.addWidget(QLabel("Random seed"), row,0); g.addWidget(self.seed,row,1); row+=1
+        self.arching_pct = QDoubleSpinBox(); self.arching_pct.setRange(0,1); self.arching_pct.setSingleStep(0.01); self.arching_pct.setValue(self.defaults.arching_pct); self._set_uniform_input_width(self.arching_pct); g.addWidget(QLabel("Arching split fraction (0–1)"), row,0); g.addWidget(self.arching_pct,row,1); row+=1
+        self.arch_factor = QDoubleSpinBox(); self.arch_factor.setRange(1,100); self.arch_factor.setValue(self.defaults.arch_stress_conc); self._set_uniform_input_width(self.arch_factor); g.addWidget(QLabel("Arch stress factor (× cave pressure)"), row,0); g.addWidget(self.arch_factor,row,1); row+=1
         return w
 
     def _connect_signals(self):
@@ -466,8 +478,10 @@ class MainWindow(QMainWindow):
         variation = float(self.mc_variation.value())
 
         def work():
-            results = []
-            avg_volumes = []
+            primary_results = []
+            primary_avg_volumes = []
+            secondary_results = []
+            secondary_avg_volumes = []
             for _ in range(runs):
                 rock = RockMass(
                     rock_type=self.rock.rock_type,
@@ -481,56 +495,141 @@ class MainWindow(QMainWindow):
                 )
                 joint_sets = [self._randomize_joint_set(js, variation) for js in self.joint_sets]
                 cave = replace(self.cave, spalling_pct=self._randomize_value(self.cave.spalling_pct, variation, 0.0, 100.0))
-                defaults = replace(self.defaults, seed=random.randint(0, 10**9))
+                defaults = Defaults(
+                    LHD_cutoff_m3=self._randomize_value(self.defaults.LHD_cutoff_m3, variation, 0.1, 50.0),
+                    seed=random.randint(0, 10**9),
+                    arching_pct=self._randomize_value(self.defaults.arching_pct, variation, 0.0, 1.0),
+                    arch_stress_conc=self._randomize_value(self.defaults.arch_stress_conc, variation, 1.0, 100.0),
+                )
+                secondary_params = SecondaryRun(
+                    draw_height=self._randomize_value(self.secondary.draw_height, variation, 1.0, 2000.0),
+                    max_caving_height=self._randomize_value(self.secondary.max_caving_height, variation, 1.0, 5000.0),
+                    swell_factor=self._randomize_value(self.secondary.swell_factor, variation, 1.0, 3.0),
+                    active_draw_width=self._randomize_value(self.secondary.active_draw_width, variation, 1.0, 200.0),
+                    added_fines_pct=self._randomize_value(self.secondary.added_fines_pct, variation, 0.0, 80.0),
+                    rate_cm_day=self._randomize_value(self.secondary.rate_cm_day, variation, 0.0, 100.0),
+                    drawbell_upper_width=self._randomize_value(self.secondary.drawbell_upper_width, variation, 1.0, 50.0),
+                    drawbell_lower_width=self._randomize_value(self.secondary.drawbell_lower_width, variation, 1.0, 50.0),
+                )
                 blocks = generate_primary_blocks(nblocks, rock, joint_sets, cave, defaults, seed=defaults.seed)
-                stats = distributions_from_blocks(blocks)
-                results.append(stats)
-                avg_volumes.append(stats["avg_volume"])
+                primary_stats = distributions_from_blocks(blocks)
+                primary_results.append(primary_stats)
+                primary_avg_volumes.append(primary_stats["avg_volume"])
 
-            if not results:
+                mu = average_scatter_deg_from_jointsets(joint_sets)
+                primary_fines_ratio = cave.spalling_pct / 100.0
+                sec_blocks, _ = run_secondary(
+                    blocks,
+                    rock,
+                    secondary_params,
+                    defaults,
+                    mu_scatter_deg=mu,
+                    primary_fines_ratio=primary_fines_ratio,
+                )
+                class P:
+                    def __init__(self, b):
+                        self.V, self.Omega, self.joints_inside = b.V, b.Omega, b.joints_inside
+
+                sec_stats = distributions_from_blocks([P(b) for b in sec_blocks])
+                secondary_results.append(sec_stats)
+                secondary_avg_volumes.append(sec_stats["avg_volume"])
+
+            if not primary_results:
                 return
 
-            xs = [lo for lo, _ in results[0]["bins"]]
-            cum_mass_runs = [stats["cum_mass"] for stats in results]
-            avg_line = [statistics.mean(vals) for vals in zip(*cum_mass_runs)]
-            min_line = [min(vals) for vals in zip(*cum_mass_runs)]
-            max_line = [max(vals) for vals in zip(*cum_mass_runs)]
+            def envelope(stats_list):
+                xs_local = [lo for lo, _ in stats_list[0]["bins"]]
+                cum_mass_runs = [stats["cum_mass"] for stats in stats_list]
+                avg_line_local = [statistics.mean(vals) for vals in zip(*cum_mass_runs)]
+                min_line_local = [min(vals) for vals in zip(*cum_mass_runs)]
+                max_line_local = [max(vals) for vals in zip(*cum_mass_runs)]
+                return xs_local, avg_line_local, min_line_local, max_line_local
+
+            primary_xs, p_avg, p_min, p_max = envelope(primary_results)
+            if secondary_results:
+                secondary_xs, s_avg, s_min, s_max = envelope(secondary_results)
+            else:
+                secondary_xs, s_avg, s_min, s_max = [], [], [], []
+
             info = {
                 "runs": runs,
                 "variation_pct": variation,
-                "mean_avg_volume": statistics.mean(avg_volumes) if avg_volumes else 0.0,
-                "min_avg_volume": min(avg_volumes) if avg_volumes else 0.0,
-                "max_avg_volume": max(avg_volumes) if avg_volumes else 0.0,
+                "primary": {
+                    "mean_avg_volume": statistics.mean(primary_avg_volumes) if primary_avg_volumes else 0.0,
+                    "min_avg_volume": min(primary_avg_volumes) if primary_avg_volumes else 0.0,
+                    "max_avg_volume": max(primary_avg_volumes) if primary_avg_volumes else 0.0,
+                },
+                "secondary": {
+                    "mean_avg_volume": statistics.mean(secondary_avg_volumes) if secondary_avg_volumes else 0.0,
+                    "min_avg_volume": min(secondary_avg_volumes) if secondary_avg_volumes else 0.0,
+                    "max_avg_volume": max(secondary_avg_volumes) if secondary_avg_volumes else 0.0,
+                },
             }
             self.sig.done_monte_carlo.emit(
-                xs,
-                [avg_line, min_line, max_line],
-                ["Average cumulative mass", "Minimum cumulative mass", "Maximum cumulative mass"],
-                info,
+                {
+                    "primary": {
+                        "xs": [primary_xs, primary_xs, primary_xs],
+                        "lines": [p_avg, p_min, p_max],
+                        "labels": [
+                            "Primary cumulative mass (average)",
+                            "Primary cumulative mass (minimum)",
+                            "Primary cumulative mass (maximum)",
+                        ],
+                    },
+                    "secondary": {
+                        "xs": [secondary_xs, secondary_xs, secondary_xs] if secondary_xs else [],
+                        "lines": [s_avg, s_min, s_max] if secondary_xs else [],
+                        "labels": [
+                            "Secondary cumulative mass (average)",
+                            "Secondary cumulative mass (minimum)",
+                            "Secondary cumulative mass (maximum)",
+                        ] if secondary_xs else [],
+                    },
+                    "info": info,
+                }
             )
 
         threading.Thread(target=work, daemon=True).start()
 
-    def on_done_monte_carlo(self, xs: List[float], lines: List[List[float]], labels: List[str], info: dict):
-        self.plot_monte_carlo.plot_lines(
-            xs,
-            lines,
-            labels=labels,
-            title="Monte Carlo cumulative mass envelopes",
-            xlabel="Block volume (m³)",
-            ylabel="Cumulative mass (%)",
-            logx=True,
-        )
+    def on_done_monte_carlo(self, result: dict):
+        primary = result.get("primary", {})
+        secondary = result.get("secondary", {})
+        xs = []
+        lines = []
+        labels = []
+        for payload in (primary, secondary):
+            xs.extend(payload.get("xs", []))
+            lines.extend(payload.get("lines", []))
+            labels.extend(payload.get("labels", []))
+
+        if lines:
+            self.plot_monte_carlo.plot_lines(
+                xs,
+                lines,
+                labels=labels,
+                title="Monte Carlo cumulative mass envelopes",
+                xlabel="Block volume (m³)",
+                ylabel="Cumulative mass (%)",
+                logx=True,
+            )
+            self.btn_save_mc_plot.setEnabled(True)
+
+        info = result.get("info", {})
+        p_info = info.get("primary", {})
+        s_info = info.get("secondary", {})
         self.lbl_mc_stats.setText(
-            "Monte Carlo runs: {runs} | Avg volume {mean:.2f} m³ (min {min:.2f}, max {max:.2f}) | Variation ±{var:.1f}%".format(
+            "Monte Carlo runs: {runs} | Primary avg volume {p_mean:.2f} m³ (min {p_min:.2f}, max {p_max:.2f}) | "
+            "Secondary avg volume {s_mean:.2f} m³ (min {s_min:.2f}, max {s_max:.2f}) | Variation ±{var:.1f}%".format(
                 runs=info.get("runs", 0),
-                mean=info.get("mean_avg_volume", 0.0),
-                min=info.get("min_avg_volume", 0.0),
-                max=info.get("max_avg_volume", 0.0),
+                p_mean=p_info.get("mean_avg_volume", 0.0),
+                p_min=p_info.get("min_avg_volume", 0.0),
+                p_max=p_info.get("max_avg_volume", 0.0),
+                s_mean=s_info.get("mean_avg_volume", 0.0),
+                s_min=s_info.get("min_avg_volume", 0.0),
+                s_max=s_info.get("max_avg_volume", 0.0),
                 var=info.get("variation_pct", 0.0),
             )
         )
-        self.btn_save_mc_plot.setEnabled(True)
 
 def launch():
     app = QApplication([])
