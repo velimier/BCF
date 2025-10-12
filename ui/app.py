@@ -234,10 +234,21 @@ class PlotWidget(QWidget):
                 xs_list = [xs] * len(ys_list)
         else:
             xs_list = []
+        style_lookup: Dict[str, Dict[str, object]] = {}
+        style_list: List[Dict[str, object]] = []
+        if isinstance(styles, dict):
+            style_lookup = styles
+        elif isinstance(styles, list):
+            style_list = styles
         for i, ys in enumerate(ys_list):
             label = labels[i] if labels and i < len(labels) else None
             cur_xs = xs_list[i] if i < len(xs_list) else xs_list[0] if xs_list else []
-            style = styles[i] if styles and i < len(styles) else {}
+            if label is not None and style_lookup:
+                style = style_lookup.get(label, {})
+            elif style_list and i < len(style_list):
+                style = style_list[i]
+            else:
+                style = {}
             display_label = style.get("label") if isinstance(style, dict) and style.get("label") else label
             color = style.get("color") if isinstance(style, dict) else None
             linestyle = style.get("linestyle") if isinstance(style, dict) and style.get("linestyle") else "-"
@@ -305,9 +316,17 @@ class MainWindow(QMainWindow):
         self._last_monte_carlo_result: dict | None = None
         self._last_monte_carlo_inputs: dict | None = None
         self._last_monte_carlo_settings: dict | None = None
+        self._last_primary_stats: dict | None = None
+        self._last_secondary_stats: dict | None = None
+
+        self._series_style_widgets: Dict[str, Dict[str, QWidget]] = {}
+        self._series_color_cursor = 0
+        self._chart_title_widgets: Dict[str, QLineEdit] = {}
+        self._axis_format_combos: Dict[str, QComboBox] = {}
 
         self._build_tabs()
         self._connect_signals()
+        self._ensure_series_style_controls(["Primary", "Secondary"])
 
     def _set_uniform_input_width(self, widget):
         widget.setMinimumWidth(140)
@@ -319,6 +338,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_primary_tab(), "Primary run")
         self.tabs.addTab(self._build_secondary_tab(), "Secondary & hang-up")
         self.tabs.addTab(self._build_monte_carlo_tab(), "Monte Carlo")
+        self.tabs.addTab(self._build_chart_settings_tab(), "Chart settings")
         self.tabs.addTab(self._build_defaults_tab(), "Defaults")
 
     def _build_geology_tab(self):
@@ -475,33 +495,6 @@ class MainWindow(QMainWindow):
         toggle_row.addStretch(1)
         plot_layout.addLayout(toggle_row)
 
-        style_group = QGroupBox("Chart styling")
-        style_layout = QVBoxLayout(style_group)
-        title_row = QHBoxLayout()
-        title_row.addWidget(QLabel("Title"))
-        self.mc_title_edit = QLineEdit("Monte Carlo cumulative mass envelopes")
-        title_row.addWidget(self.mc_title_edit)
-        style_layout.addLayout(title_row)
-
-        axis_row = QHBoxLayout()
-        axis_row.addWidget(QLabel("X-axis format"))
-        self.mc_xformat_combo = QComboBox()
-        self.mc_xformat_combo.addItems(["Auto", "0", "0.0", "0.00", "Scientific (1eX)"])
-        axis_row.addWidget(self.mc_xformat_combo)
-        axis_row.addSpacing(12)
-        axis_row.addWidget(QLabel("Y-axis format"))
-        self.mc_yformat_combo = QComboBox()
-        self.mc_yformat_combo.addItems(["Auto", "0", "0.0", "0.00", "Scientific (1eX)"])
-        axis_row.addWidget(self.mc_yformat_combo)
-        axis_row.addStretch(1)
-        style_layout.addLayout(axis_row)
-
-        style_layout.addWidget(QLabel("Series styling"))
-        self.mc_series_container = QVBoxLayout()
-        style_layout.addLayout(self.mc_series_container)
-        style_layout.addStretch(1)
-        plot_layout.addWidget(style_group)
-
         self.plot_monte_carlo = PlotWidget()
         plot_layout.addWidget(self.plot_monte_carlo)
         btn_row = QHBoxLayout(); btn_row.addStretch(1)
@@ -516,9 +509,58 @@ class MainWindow(QMainWindow):
         plot_layout.addWidget(self.lbl_mc_stats)
         layout.addLayout(plot_layout, 1)
 
-        self._mc_style_widgets: Dict[str, Dict[str, QWidget]] = {}
-        self._mc_color_cursor = 0
+        return w
 
+    def _build_chart_settings_tab(self):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        self._chart_title_widgets.clear()
+        self._axis_format_combos.clear()
+
+        title_group = QGroupBox("Chart titles")
+        title_layout = QGridLayout(title_group)
+        title_defs = [
+            ("primary", "Primary chart title", "Primary fragmentation (cum. mass)"),
+            ("secondary", "Secondary chart title", "Primary vs Secondary (cum. mass)"),
+            ("monte_carlo", "Monte Carlo chart title", "Monte Carlo cumulative mass envelopes"),
+        ]
+        for row, (key, label, default) in enumerate(title_defs):
+            title_layout.addWidget(QLabel(label), row, 0)
+            edit = QLineEdit(default)
+            self._chart_title_widgets[key] = edit
+            title_layout.addWidget(edit, row, 1)
+            edit.textChanged.connect(self._refresh_all_plots)
+        layout.addWidget(title_group)
+
+        axis_group = QGroupBox("Axis number formatting")
+        axis_layout = QHBoxLayout(axis_group)
+        axis_layout.addWidget(QLabel("Volume axis"))
+        fmt_options = ["Auto", "0", "0.0", "0.00", "Scientific (1eX)"]
+        combo_x = QComboBox()
+        combo_x.addItems(fmt_options)
+        self._axis_format_combos["x"] = combo_x
+        axis_layout.addWidget(combo_x)
+        axis_layout.addSpacing(12)
+        axis_layout.addWidget(QLabel("Cumulative axis"))
+        combo_y = QComboBox()
+        combo_y.addItems(fmt_options)
+        self._axis_format_combos["y"] = combo_y
+        axis_layout.addWidget(combo_y)
+        axis_layout.addStretch(1)
+        combo_x.currentIndexChanged.connect(self._refresh_all_plots)
+        combo_y.currentIndexChanged.connect(self._refresh_all_plots)
+        layout.addWidget(axis_group)
+
+        series_group = QGroupBox("Series styling")
+        series_layout = QVBoxLayout(series_group)
+        series_layout.addWidget(QLabel("Configure legend label, color, dash, and width for each data series."))
+        self._series_style_container = QVBoxLayout()
+        series_layout.addLayout(self._series_style_container)
+        series_layout.addStretch(1)
+        layout.addWidget(series_group)
+
+        layout.addStretch(1)
         return w
 
     def _build_defaults_tab(self):
@@ -542,9 +584,6 @@ class MainWindow(QMainWindow):
         self.btn_save_mc_report.clicked.connect(self.on_save_monte_carlo_report)
         self.chk_show_primary.toggled.connect(self._refresh_monte_carlo_plot)
         self.chk_show_secondary.toggled.connect(self._refresh_monte_carlo_plot)
-        self.mc_title_edit.textChanged.connect(self._refresh_monte_carlo_plot)
-        self.mc_xformat_combo.currentIndexChanged.connect(self._refresh_monte_carlo_plot)
-        self.mc_yformat_combo.currentIndexChanged.connect(self._refresh_monte_carlo_plot)
         self.sig.done_primary.connect(self.on_done_primary)
         self.sig.done_secondary.connect(self.on_done_secondary)
         self.sig.done_hangup.connect(self.on_done_hangup)
@@ -601,6 +640,11 @@ class MainWindow(QMainWindow):
     def on_run_primary(self):
         self.update_models_from_ui()
         n = int(self.nblocks.value())
+        self._last_secondary_stats = None
+        self.plot_secondary.fig.clear()
+        self.plot_secondary.canvas.draw_idle()
+        self.plot_secondary.has_data = False
+        self.btn_save_secondary_plot.setEnabled(False)
         def work():
             blocks = generate_primary_blocks(n, self.rock, self.joint_sets, self.cave, self.defaults, seed=self.defaults.seed or 1234)
             primary_fines_ratio = self.cave.spalling_pct/100.0
@@ -613,7 +657,9 @@ class MainWindow(QMainWindow):
         self.primary_blocks = blocks
         self.primary_fines_ratio = fines_ratio
         stats = distributions_from_blocks(blocks)
-        self.plot_primary.plot_distributions(stats, None, title="Primary fragmentation (cum. mass)")
+        self._last_primary_stats = stats
+        self._ensure_series_style_controls(["Primary"])
+        self._refresh_primary_plot()
         self.btn_save_prm.setEnabled(True)
         self.btn_save_primary_plot.setEnabled(True)
         QMessageBox.information(self, "Primary run complete", f"Generated {len(blocks)} blocks.\nTemporary .PRM written to:\n{path}")
@@ -643,10 +689,13 @@ class MainWindow(QMainWindow):
     def on_done_secondary(self, sec_blocks, sec_fines_ratio, path):
         self.secondary_blocks = sec_blocks
         prim_stats = distributions_from_blocks(self.primary_blocks)
-        class P: 
+        class P:
             def __init__(self,b): self.V,self.Omega,self.joints_inside=b.V,b.Omega,b.joints_inside
         sec_stats = distributions_from_blocks([P(b) for b in sec_blocks])
-        self.plot_secondary.plot_distributions(prim_stats, sec_stats, title="Primary vs Secondary (cum. mass)")
+        self._last_primary_stats = prim_stats
+        self._last_secondary_stats = sec_stats
+        self._ensure_series_style_controls(["Primary", "Secondary"])
+        self._refresh_secondary_plot()
         self.btn_save_sec.setEnabled(True)
         self.btn_save_secondary_plot.setEnabled(True)
 
@@ -797,7 +846,11 @@ class MainWindow(QMainWindow):
 
     def on_done_monte_carlo(self, result: dict):
         self._last_monte_carlo_result = result
-        self._ensure_monte_carlo_style_controls()
+        labels = []
+        for key in ("primary", "secondary"):
+            series = (result.get(key) or {}).get("series") or []
+            labels.extend([label for label, _ in series])
+        self._ensure_series_style_controls(labels)
         self._refresh_monte_carlo_plot()
         info = result.get("info", {})
         p_info = info.get("primary", {})
@@ -817,15 +870,94 @@ class MainWindow(QMainWindow):
         )
         self.btn_save_mc_report.setEnabled(True)
 
+    def _refresh_all_plots(self):
+        self._refresh_primary_plot()
+        self._refresh_secondary_plot()
+        self._refresh_monte_carlo_plot()
+
+    def _refresh_primary_plot(self):
+        stats = self._last_primary_stats
+        if not stats:
+            return
+        xs = [lo for lo, _ in stats.get("bins", [])]
+        ys = stats.get("cum_mass") or []
+        if not xs or not ys:
+            return
+        label = "Primary"
+        self._ensure_series_style_controls([label])
+        styles = {label: self._collect_series_style(label)}
+        self.plot_primary.plot_lines(
+            xs,
+            [ys],
+            labels=[label],
+            title=self._chart_title("primary", "Primary fragmentation (cum. mass)"),
+            xlabel="Block volume (m³)",
+            ylabel="Cumulative mass (%)",
+            logx=True,
+            styles=styles,
+            x_formatter=self._axis_formatter_from_choice(self._axis_format_choice("x")),
+            y_formatter=self._axis_formatter_from_choice(self._axis_format_choice("y")),
+        )
+
+    def _refresh_secondary_plot(self):
+        prim_stats = self._last_primary_stats
+        sec_stats = self._last_secondary_stats
+        if not prim_stats:
+            return
+        staged: List[Tuple[str, List[float], List[float]]] = []
+        labels: List[str] = []
+        xs_primary = [lo for lo, _ in prim_stats.get("bins", [])]
+        ys_primary = prim_stats.get("cum_mass") or []
+        if xs_primary and ys_primary:
+            staged.append(("Primary", xs_primary, ys_primary))
+            labels.append("Primary")
+        if sec_stats:
+            xs_secondary = [lo for lo, _ in sec_stats.get("bins", [])]
+            ys_secondary = sec_stats.get("cum_mass") or []
+            if xs_secondary and ys_secondary:
+                staged.append(("Secondary", xs_secondary, ys_secondary))
+                labels.append("Secondary")
+        if not staged:
+            return
+        self._ensure_series_style_controls(labels)
+        xs_list = [entry[1] for entry in staged]
+        ys_list = [entry[2] for entry in staged]
+        style_lookup = {label: self._collect_series_style(label) for label in labels}
+        self.plot_secondary.plot_lines(
+            xs_list,
+            ys_list,
+            labels=labels,
+            title=self._chart_title("secondary", "Primary vs Secondary (cum. mass)"),
+            xlabel="Block volume (m³)",
+            ylabel="Cumulative mass (%)",
+            logx=True,
+            styles=style_lookup,
+            x_formatter=self._axis_formatter_from_choice(self._axis_format_choice("x")),
+            y_formatter=self._axis_formatter_from_choice(self._axis_format_choice("y")),
+        )
+
+    def _axis_format_choice(self, axis: str) -> str:
+        combo = self._axis_format_combos.get(axis)
+        if isinstance(combo, QComboBox):
+            return combo.currentText() or "Auto"
+        return "Auto"
+
+    def _chart_title(self, key: str, fallback: str) -> str:
+        widget = self._chart_title_widgets.get(key)
+        if isinstance(widget, QLineEdit):
+            text = widget.text().strip()
+            if text:
+                return text
+        return fallback
+
     def _refresh_monte_carlo_plot(self):
         result = self._last_monte_carlo_result
         xs_list: List[List[float]] = []
         lines: List[List[float]] = []
         labels: List[str] = []
-        styles: List[Dict[str, object]] = []
-
-        if result:
-            self._ensure_monte_carlo_style_controls()
+        styles: Dict[str, Dict[str, object]] = {}
+        staged_series: List[Tuple[str, List[float], List[float]]] = []
+        label_names: List[str] = []
 
         if result and self.chk_show_primary.isChecked():
             primary = result.get("primary") or {}
@@ -833,10 +965,8 @@ class MainWindow(QMainWindow):
             series = primary.get("series") or []
             if xs and series:
                 for label, values in series:
-                    xs_list.append(xs)
-                    lines.append(values)
-                    labels.append(label)
-                    styles.append(self._collect_series_style(label))
+                    staged_series.append((label, xs, values))
+                    label_names.append(label)
 
         if result and self.chk_show_secondary.isChecked():
             secondary = result.get("secondary") or {}
@@ -844,15 +974,20 @@ class MainWindow(QMainWindow):
             series = secondary.get("series") or []
             if xs and series:
                 for label, values in series:
-                    xs_list.append(xs)
-                    lines.append(values)
-                    labels.append(label)
-                    styles.append(self._collect_series_style(label))
+                    staged_series.append((label, xs, values))
+                    label_names.append(label)
+
+        if label_names:
+            self._ensure_series_style_controls(label_names)
+
+        for label, xs, values in staged_series:
+            xs_list.append(xs)
+            lines.append(values)
+            labels.append(label)
+            styles[label] = self._collect_series_style(label)
 
         if lines:
-            title_text = self.mc_title_edit.text().strip() if hasattr(self, "mc_title_edit") else ""
-            if not title_text:
-                title_text = "Monte Carlo cumulative mass envelopes"
+            title_text = self._chart_title("monte_carlo", "Monte Carlo cumulative mass envelopes")
             self.plot_monte_carlo.plot_lines(
                 xs_list,
                 lines,
@@ -862,8 +997,8 @@ class MainWindow(QMainWindow):
                 ylabel="Cumulative mass (%)",
                 logx=True,
                 styles=styles,
-                x_formatter=self._axis_formatter_from_choice(self.mc_xformat_combo.currentText() if hasattr(self, "mc_xformat_combo") else "Auto"),
-                y_formatter=self._axis_formatter_from_choice(self.mc_yformat_combo.currentText() if hasattr(self, "mc_yformat_combo") else "Auto"),
+                x_formatter=self._axis_formatter_from_choice(self._axis_format_choice("x")),
+                y_formatter=self._axis_formatter_from_choice(self._axis_format_choice("y")),
             )
             self.btn_save_mc_plot.setEnabled(True)
         else:
@@ -1014,27 +1149,18 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "Report saved", f"Monte Carlo report saved to:\n{path}")
 
-    def _ensure_monte_carlo_style_controls(self):
-        if not hasattr(self, "mc_series_container"):
+    def _ensure_series_style_controls(self, labels: List[str]):
+        if not hasattr(self, "_series_style_container"):
             return
-        result = self._last_monte_carlo_result or {}
-        labels = []
-        for key in ("primary", "secondary"):
-            series = (result.get(key) or {}).get("series") or []
-            labels.extend([label for label, _ in series])
-        existing = set(self._mc_style_widgets.keys())
         for label in labels:
-            if label not in existing:
-                self._add_monte_carlo_style_row(label)
-        for label, widgets in self._mc_style_widgets.items():
-            container = widgets.get("container")
-            if container is not None:
-                container.setVisible(label in labels)
+            if label not in self._series_style_widgets:
+                self._add_series_style_row(label)
 
-    def _add_monte_carlo_style_row(self, label: str):
+    def _add_series_style_row(self, label: str):
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
+
         base_label = QLabel(label)
         base_label.setMinimumWidth(180)
         layout.addWidget(base_label)
@@ -1046,9 +1172,8 @@ class MainWindow(QMainWindow):
         color_combo = QComboBox()
         for color_name, color_value in MC_COLOR_OPTIONS:
             color_combo.addItem(color_name, color_value)
-        default_color_index = self._mc_color_cursor % len(MC_COLOR_OPTIONS)
+        default_color_index = self._preferred_color_index(label)
         color_combo.setCurrentIndex(default_color_index)
-        self._mc_color_cursor += 1
         layout.addWidget(color_combo)
 
         dash_combo = QComboBox()
@@ -1064,21 +1189,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(width_spin)
 
         layout.addStretch(1)
-        self.mc_series_container.addWidget(row)
-        self._mc_style_widgets[label] = {
+        self._series_style_container.addWidget(row)
+        self._series_style_widgets[label] = {
             "container": row,
             "name": name_edit,
             "color": color_combo,
             "dash": dash_combo,
             "width": width_spin,
         }
-        name_edit.textChanged.connect(self._refresh_monte_carlo_plot)
-        color_combo.currentIndexChanged.connect(self._refresh_monte_carlo_plot)
-        dash_combo.currentIndexChanged.connect(self._refresh_monte_carlo_plot)
-        width_spin.valueChanged.connect(self._refresh_monte_carlo_plot)
+
+        name_edit.textChanged.connect(self._refresh_all_plots)
+        color_combo.currentIndexChanged.connect(self._refresh_all_plots)
+        dash_combo.currentIndexChanged.connect(self._refresh_all_plots)
+        width_spin.valueChanged.connect(self._refresh_all_plots)
 
     def _collect_series_style(self, label: str) -> Dict[str, object]:
-        widgets = self._mc_style_widgets.get(label)
+        widgets = self._series_style_widgets.get(label)
         if not widgets:
             return {"label": label}
         name_widget = widgets.get("name")
@@ -1113,6 +1239,20 @@ class MainWindow(QMainWindow):
         if any(word in text for word in ("minimum", "maximum")):
             return 1.3
         return 1.5
+
+    def _preferred_color_index(self, label: str) -> int:
+        text = label.lower()
+        if "primary" in text:
+            if self._series_color_cursor < 2:
+                self._series_color_cursor = 2
+            return 0
+        if "secondary" in text:
+            if self._series_color_cursor < 2:
+                self._series_color_cursor = 2
+            return 1
+        idx = self._series_color_cursor % len(MC_COLOR_OPTIONS)
+        self._series_color_cursor += 1
+        return idx
 
     def _index_for_dash(self, dash: str) -> int:
         for idx, (_, pattern) in enumerate(LINE_STYLE_OPTIONS):
