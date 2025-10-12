@@ -1,6 +1,7 @@
 from __future__ import annotations
-import os, random, statistics, threading
-from dataclasses import replace
+import json, os, random, statistics, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, replace
 from typing import List
 
 from PySide6.QtWidgets import (
@@ -119,6 +120,9 @@ class MainWindow(QMainWindow):
         self.primary_blocks: List[PrimaryBlock] = []
         self.primary_fines_ratio = 0.0
         self.secondary_blocks = []
+        self._last_monte_carlo_result: dict | None = None
+        self._last_monte_carlo_inputs: dict | None = None
+        self._last_monte_carlo_settings: dict | None = None
 
         self._build_tabs()
         self._connect_signals()
@@ -278,9 +282,23 @@ class MainWindow(QMainWindow):
         layout.addLayout(controls, 0)
 
         plot_layout = QVBoxLayout()
+        toggle_row = QHBoxLayout()
+        toggle_row.addWidget(QLabel("Series visibility:"))
+        self.chk_show_primary = QCheckBox("Primary")
+        self.chk_show_primary.setChecked(True)
+        self.chk_show_secondary = QCheckBox("Secondary")
+        self.chk_show_secondary.setChecked(True)
+        toggle_row.addWidget(self.chk_show_primary)
+        toggle_row.addWidget(self.chk_show_secondary)
+        toggle_row.addStretch(1)
+        plot_layout.addLayout(toggle_row)
+
         self.plot_monte_carlo = PlotWidget()
         plot_layout.addWidget(self.plot_monte_carlo)
         btn_row = QHBoxLayout(); btn_row.addStretch(1)
+        self.btn_save_mc_report = QPushButton("Save report…")
+        self.btn_save_mc_report.setEnabled(False)
+        btn_row.addWidget(self.btn_save_mc_report)
         self.btn_save_mc_plot = QPushButton("Save chart…")
         self.btn_save_mc_plot.setEnabled(False)
         btn_row.addWidget(self.btn_save_mc_plot)
@@ -309,6 +327,9 @@ class MainWindow(QMainWindow):
         self.btn_save_secondary_plot.clicked.connect(lambda: self.plot_secondary.save_dialog(self, "secondary_distribution.png"))
         self.btn_run_monte_carlo.clicked.connect(self.on_run_monte_carlo)
         self.btn_save_mc_plot.clicked.connect(lambda: self.plot_monte_carlo.save_dialog(self, "monte_carlo.png"))
+        self.btn_save_mc_report.clicked.connect(self.on_save_monte_carlo_report)
+        self.chk_show_primary.toggled.connect(self._refresh_monte_carlo_plot)
+        self.chk_show_secondary.toggled.connect(self._refresh_monte_carlo_plot)
         self.sig.done_primary.connect(self.on_done_primary)
         self.sig.done_secondary.connect(self.on_done_secondary)
         self.sig.done_hangup.connect(self.on_done_hangup)
@@ -436,23 +457,32 @@ class MainWindow(QMainWindow):
     def on_done_hangup(self, stats: dict):
         self.lbl_hang.setText(f"Hang-ups → High: {stats['n_high']}  Low: {stats['n_low']}  Total hang-up tons (proxy): {stats['total_hangup_tons']:.1f} t")
 
-    def _randomize_value(self, value: float, variation_pct: float, minimum: float | None = None, maximum: float | None = None):
+    def _randomize_value(
+        self,
+        value: float,
+        variation_pct: float,
+        minimum: float | None = None,
+        maximum: float | None = None,
+        rng: random.Random | None = None,
+    ):
+        rng = rng or random
         if variation_pct <= 0:
             new_val = value
         else:
             delta = variation_pct / 100.0
-            new_val = value * (1.0 + random.uniform(-delta, delta))
+            new_val = value * (1.0 + rng.uniform(-delta, delta))
         if minimum is not None:
             new_val = max(minimum, new_val)
         if maximum is not None:
             new_val = min(maximum, new_val)
         return new_val
 
-    def _randomize_joint_set(self, js: JointSet, variation_pct: float) -> JointSet:
+    def _randomize_joint_set(self, js: JointSet, variation_pct: float, rng: random.Random | None = None) -> JointSet:
+        rng = rng or random
         spacing_vals = [
-            self._randomize_value(js.spacing.min, variation_pct, 0.01),
-            self._randomize_value(js.spacing.mean, variation_pct, 0.02),
-            self._randomize_value(js.spacing.max_or_90pct, variation_pct, 0.05),
+            self._randomize_value(js.spacing.min, variation_pct, 0.01, rng=rng),
+            self._randomize_value(js.spacing.mean, variation_pct, 0.02, rng=rng),
+            self._randomize_value(js.spacing.max_or_90pct, variation_pct, 0.05, rng=rng),
         ]
         spacing_vals.sort()
         spacing = SpacingDist(
@@ -463,12 +493,12 @@ class MainWindow(QMainWindow):
         )
         return JointSet(
             name=js.name,
-            mean_dip=self._randomize_value(js.mean_dip, variation_pct, 0.0, 90.0),
-            dip_range=self._randomize_value(js.dip_range, variation_pct, 0.0, 90.0),
-            mean_dip_dir=self._randomize_value(js.mean_dip_dir, variation_pct, 0.0, 360.0),
-            dip_dir_range=self._randomize_value(js.dip_dir_range, variation_pct, 0.0, 180.0),
+            mean_dip=self._randomize_value(js.mean_dip, variation_pct, 0.0, 90.0, rng=rng),
+            dip_range=self._randomize_value(js.dip_range, variation_pct, 0.0, 90.0, rng=rng),
+            mean_dip_dir=self._randomize_value(js.mean_dip_dir, variation_pct, 0.0, 360.0, rng=rng),
+            dip_dir_range=self._randomize_value(js.dip_dir_range, variation_pct, 0.0, 180.0, rng=rng),
             spacing=spacing,
-            JC=int(round(self._randomize_value(js.JC, variation_pct, 0, 40)))
+            JC=int(round(self._randomize_value(js.JC, variation_pct, 0, 40, rng=rng)))
         )
 
     def on_run_monte_carlo(self):
@@ -477,45 +507,64 @@ class MainWindow(QMainWindow):
         nblocks = int(self.mc_blocks.value())
         variation = float(self.mc_variation.value())
 
+        self._last_monte_carlo_result = None
+        self._last_monte_carlo_inputs = {
+            "rock": asdict(self.rock),
+            "joint_sets": [asdict(js) for js in self.joint_sets],
+            "cave": asdict(self.cave),
+            "defaults": asdict(self.defaults),
+            "secondary": asdict(self.secondary),
+        }
+        self._last_monte_carlo_settings = {
+            "runs": runs,
+            "blocks_per_run": nblocks,
+            "variation_pct": variation,
+        }
+        self.btn_save_mc_plot.setEnabled(False)
+        self.btn_save_mc_report.setEnabled(False)
+        self.lbl_mc_stats.setText("Monte Carlo: running…")
+        self._refresh_monte_carlo_plot()
+
         def work():
             primary_results = []
             primary_avg_volumes = []
             secondary_results = []
             secondary_avg_volumes = []
-            for _ in range(runs):
+            max_workers = max(1, min(runs, os.cpu_count() or 4))
+
+            def run_single(_index: int):
+                seed = random.randint(0, 10**9)
+                rng = random.Random(seed)
                 rock = RockMass(
                     rock_type=self.rock.rock_type,
-                    MRMR=self._randomize_value(self.rock.MRMR, variation, 0.0, 100.0),
-                    IRS=self._randomize_value(self.rock.IRS, variation, 1.0, 500.0),
+                    MRMR=self._randomize_value(self.rock.MRMR, variation, 0.0, 100.0, rng=rng),
+                    IRS=self._randomize_value(self.rock.IRS, variation, 1.0, 500.0, rng=rng),
                     IBS=self.rock.IBS,
-                    mi=self._randomize_value(self.rock.mi, variation, 1.0, 50.0),
-                    frac_freq=self._randomize_value(self.rock.frac_freq, variation, 0.0, 20.0),
-                    frac_condition=int(round(self._randomize_value(self.rock.frac_condition, variation, 0, 40))),
-                    density=self._randomize_value(self.rock.density, variation, 1500.0, 4500.0),
+                    mi=self._randomize_value(self.rock.mi, variation, 1.0, 50.0, rng=rng),
+                    frac_freq=self._randomize_value(self.rock.frac_freq, variation, 0.0, 20.0, rng=rng),
+                    frac_condition=int(round(self._randomize_value(self.rock.frac_condition, variation, 0, 40, rng=rng))),
+                    density=self._randomize_value(self.rock.density, variation, 1500.0, 4500.0, rng=rng),
                 )
-                joint_sets = [self._randomize_joint_set(js, variation) for js in self.joint_sets]
-                cave = replace(self.cave, spalling_pct=self._randomize_value(self.cave.spalling_pct, variation, 0.0, 100.0))
+                joint_sets = [self._randomize_joint_set(js, variation, rng=rng) for js in self.joint_sets]
+                cave = replace(self.cave, spalling_pct=self._randomize_value(self.cave.spalling_pct, variation, 0.0, 100.0, rng=rng))
                 defaults = Defaults(
-                    LHD_cutoff_m3=self._randomize_value(self.defaults.LHD_cutoff_m3, variation, 0.1, 50.0),
-                    seed=random.randint(0, 10**9),
-                    arching_pct=self._randomize_value(self.defaults.arching_pct, variation, 0.0, 1.0),
-                    arch_stress_conc=self._randomize_value(self.defaults.arch_stress_conc, variation, 1.0, 100.0),
+                    LHD_cutoff_m3=self._randomize_value(self.defaults.LHD_cutoff_m3, variation, 0.1, 50.0, rng=rng),
+                    seed=rng.randint(0, 10**9),
+                    arching_pct=self._randomize_value(self.defaults.arching_pct, variation, 0.0, 1.0, rng=rng),
+                    arch_stress_conc=self._randomize_value(self.defaults.arch_stress_conc, variation, 1.0, 100.0, rng=rng),
                 )
                 secondary_params = SecondaryRun(
-                    draw_height=self._randomize_value(self.secondary.draw_height, variation, 1.0, 2000.0),
-                    max_caving_height=self._randomize_value(self.secondary.max_caving_height, variation, 1.0, 5000.0),
-                    swell_factor=self._randomize_value(self.secondary.swell_factor, variation, 1.0, 3.0),
-                    active_draw_width=self._randomize_value(self.secondary.active_draw_width, variation, 1.0, 200.0),
-                    added_fines_pct=self._randomize_value(self.secondary.added_fines_pct, variation, 0.0, 80.0),
-                    rate_cm_day=self._randomize_value(self.secondary.rate_cm_day, variation, 0.0, 100.0),
-                    drawbell_upper_width=self._randomize_value(self.secondary.drawbell_upper_width, variation, 1.0, 50.0),
-                    drawbell_lower_width=self._randomize_value(self.secondary.drawbell_lower_width, variation, 1.0, 50.0),
+                    draw_height=self._randomize_value(self.secondary.draw_height, variation, 1.0, 2000.0, rng=rng),
+                    max_caving_height=self._randomize_value(self.secondary.max_caving_height, variation, 1.0, 5000.0, rng=rng),
+                    swell_factor=self._randomize_value(self.secondary.swell_factor, variation, 1.0, 3.0, rng=rng),
+                    active_draw_width=self._randomize_value(self.secondary.active_draw_width, variation, 1.0, 200.0, rng=rng),
+                    added_fines_pct=self._randomize_value(self.secondary.added_fines_pct, variation, 0.0, 80.0, rng=rng),
+                    rate_cm_day=self._randomize_value(self.secondary.rate_cm_day, variation, 0.0, 100.0, rng=rng),
+                    drawbell_upper_width=self._randomize_value(self.secondary.drawbell_upper_width, variation, 1.0, 50.0, rng=rng),
+                    drawbell_lower_width=self._randomize_value(self.secondary.drawbell_lower_width, variation, 1.0, 50.0, rng=rng),
                 )
                 blocks = generate_primary_blocks(nblocks, rock, joint_sets, cave, defaults, seed=defaults.seed)
                 primary_stats = distributions_from_blocks(blocks)
-                primary_results.append(primary_stats)
-                primary_avg_volumes.append(primary_stats["avg_volume"])
-
                 mu = average_scatter_deg_from_jointsets(joint_sets)
                 primary_fines_ratio = cave.spalling_pct / 100.0
                 sec_blocks, _ = run_secondary(
@@ -526,13 +575,22 @@ class MainWindow(QMainWindow):
                     mu_scatter_deg=mu,
                     primary_fines_ratio=primary_fines_ratio,
                 )
+
                 class P:
                     def __init__(self, b):
                         self.V, self.Omega, self.joints_inside = b.V, b.Omega, b.joints_inside
 
                 sec_stats = distributions_from_blocks([P(b) for b in sec_blocks])
-                secondary_results.append(sec_stats)
-                secondary_avg_volumes.append(sec_stats["avg_volume"])
+                return primary_stats, sec_stats
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(run_single, i) for i in range(runs)]
+                for fut in as_completed(futures):
+                    primary_stats, sec_stats = fut.result()
+                    primary_results.append(primary_stats)
+                    primary_avg_volumes.append(primary_stats["avg_volume"])
+                    secondary_results.append(sec_stats)
+                    secondary_avg_volumes.append(sec_stats["avg_volume"])
 
             if not primary_results:
                 return
@@ -568,23 +626,21 @@ class MainWindow(QMainWindow):
             self.sig.done_monte_carlo.emit(
                 {
                     "primary": {
-                        "xs": [primary_xs, primary_xs, primary_xs],
-                        "lines": [p_avg, p_min, p_max],
-                        "labels": [
-                            "Primary cumulative mass (average)",
-                            "Primary cumulative mass (minimum)",
-                            "Primary cumulative mass (maximum)",
+                        "xs": primary_xs,
+                        "series": [
+                            ("Primary cumulative mass (average)", p_avg),
+                            ("Primary cumulative mass (minimum)", p_min),
+                            ("Primary cumulative mass (maximum)", p_max),
                         ],
                     },
                     "secondary": {
-                        "xs": [secondary_xs, secondary_xs, secondary_xs] if secondary_xs else [],
-                        "lines": [s_avg, s_min, s_max] if secondary_xs else [],
-                        "labels": [
-                            "Secondary cumulative mass (average)",
-                            "Secondary cumulative mass (minimum)",
-                            "Secondary cumulative mass (maximum)",
-                        ] if secondary_xs else [],
-                    },
+                        "xs": secondary_xs,
+                        "series": [
+                            ("Secondary cumulative mass (average)", s_avg),
+                            ("Secondary cumulative mass (minimum)", s_min),
+                            ("Secondary cumulative mass (maximum)", s_max),
+                        ],
+                    } if secondary_xs else None,
                     "info": info,
                 }
             )
@@ -592,28 +648,8 @@ class MainWindow(QMainWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def on_done_monte_carlo(self, result: dict):
-        primary = result.get("primary", {})
-        secondary = result.get("secondary", {})
-        xs = []
-        lines = []
-        labels = []
-        for payload in (primary, secondary):
-            xs.extend(payload.get("xs", []))
-            lines.extend(payload.get("lines", []))
-            labels.extend(payload.get("labels", []))
-
-        if lines:
-            self.plot_monte_carlo.plot_lines(
-                xs,
-                lines,
-                labels=labels,
-                title="Monte Carlo cumulative mass envelopes",
-                xlabel="Block volume (m³)",
-                ylabel="Cumulative mass (%)",
-                logx=True,
-            )
-            self.btn_save_mc_plot.setEnabled(True)
-
+        self._last_monte_carlo_result = result
+        self._refresh_monte_carlo_plot()
         info = result.get("info", {})
         p_info = info.get("primary", {})
         s_info = info.get("secondary", {})
@@ -630,6 +666,97 @@ class MainWindow(QMainWindow):
                 var=info.get("variation_pct", 0.0),
             )
         )
+        self.btn_save_mc_report.setEnabled(True)
+
+    def _refresh_monte_carlo_plot(self):
+        result = self._last_monte_carlo_result
+        xs_list: List[List[float]] = []
+        lines: List[List[float]] = []
+        labels: List[str] = []
+
+        if result and self.chk_show_primary.isChecked():
+            primary = result.get("primary") or {}
+            xs = primary.get("xs")
+            series = primary.get("series") or []
+            if xs and series:
+                for label, values in series:
+                    xs_list.append(xs)
+                    lines.append(values)
+                    labels.append(label)
+
+        if result and self.chk_show_secondary.isChecked():
+            secondary = result.get("secondary") or {}
+            xs = secondary.get("xs")
+            series = secondary.get("series") or []
+            if xs and series:
+                for label, values in series:
+                    xs_list.append(xs)
+                    lines.append(values)
+                    labels.append(label)
+
+        if lines:
+            self.plot_monte_carlo.plot_lines(
+                xs_list,
+                lines,
+                labels=labels,
+                title="Monte Carlo cumulative mass envelopes",
+                xlabel="Block volume (m³)",
+                ylabel="Cumulative mass (%)",
+                logx=True,
+            )
+            self.btn_save_mc_plot.setEnabled(True)
+        else:
+            self.plot_monte_carlo.fig.clear()
+            self.plot_monte_carlo.canvas.draw_idle()
+            self.plot_monte_carlo.has_data = False
+            self.btn_save_mc_plot.setEnabled(False)
+
+    def on_save_monte_carlo_report(self):
+        if not self._last_monte_carlo_result or not self._last_monte_carlo_settings:
+            QMessageBox.warning(self, "No Monte Carlo run", "Run Monte Carlo before saving a report.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Monte Carlo report",
+            "monte_carlo_report.json",
+            "JSON files (*.json);;Text files (*.txt);;All files (*)",
+        )
+        if not path:
+            return
+
+        info = self._last_monte_carlo_result.get("info", {})
+        primary = self._last_monte_carlo_result.get("primary") or {}
+        secondary = self._last_monte_carlo_result.get("secondary") or {}
+
+        def envelope_points(xs: List[float], label_values: List[tuple[str, List[float]]]):
+            points = []
+            for label, values in label_values:
+                points.append(
+                    {
+                        "label": label,
+                        "data": [
+                            {"block_volume_m3": vol, "cumulative_mass_pct": val}
+                            for vol, val in zip(xs, values)
+                        ],
+                    }
+                )
+            return points
+
+        report_payload = {
+            "simulation_settings": self._last_monte_carlo_settings,
+            "base_inputs": self._last_monte_carlo_inputs,
+            "summary": info,
+            "primary_envelope": envelope_points(primary.get("xs") or [], primary.get("series") or []),
+            "secondary_envelope": envelope_points(secondary.get("xs") or [], secondary.get("series") or []),
+        }
+
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(report_payload, fh, indent=2)
+        except Exception as exc:  # pragma: no cover - UI feedback
+            QMessageBox.critical(self, "Save failed", f"Could not save report:\n{exc}")
+        else:
+            QMessageBox.information(self, "Report saved", f"Monte Carlo report saved to:\n{path}")
 
 def launch():
     app = QApplication([])
