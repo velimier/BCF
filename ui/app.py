@@ -204,10 +204,17 @@ class PlotWidget(QWidget):
         self.canvas = FigureCanvas(self.fig)
         self.toolbar = NavigationToolbar(self.canvas, self)
         lay = QVBoxLayout()
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
         lay.addWidget(self.toolbar)
         lay.addWidget(self.canvas)
         self.setLayout(lay)
-        self.canvas.setMinimumHeight(320)
+        self.toolbar.setStyleSheet("QToolBar { border: 0; background: transparent; }")
+        self.canvas.setMinimumHeight(340)
+        self.canvas.setStyleSheet(
+            "background-color: #ffffff; border: 1px solid #d4d9e2; border-radius: 8px;"
+        )
+        self.fig.set_facecolor("#f3f6fb")
         self.has_data = False
 
     def plot_distributions(self, prim_stats: dict, sec_stats: dict | None = None, title: str = ""):
@@ -221,8 +228,8 @@ class PlotWidget(QWidget):
         ax.set_xlabel("Block volume (m³)")
         ax.set_ylabel("Cumulative mass (%)")
         ax.set_title(title)
-        ax.grid(True, which="both", linestyle=":")
-        ax.legend()
+        ax.grid(True, which="both", linestyle=":", color="#cfd6e6", linewidth=0.6)
+        self._finalize_axes(ax, show_legend=True)
         self.canvas.draw_idle()
         self.has_data = True
 
@@ -273,15 +280,44 @@ class PlotWidget(QWidget):
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.set_title(title)
-        ax.grid(True, which="both", linestyle=":")
-        if labels or (styles and any(isinstance(style, dict) and style.get("label") for style in (styles or []))):
-            ax.legend()
+        ax.grid(True, which="both", linestyle=":", color="#cfd6e6", linewidth=0.6)
+        show_legend = bool(ax.get_legend_handles_labels()[1])
+        self._finalize_axes(ax, show_legend=show_legend)
         if x_formatter is not None:
             ax.xaxis.set_major_formatter(x_formatter)
         if y_formatter is not None:
             ax.yaxis.set_major_formatter(y_formatter)
         self.canvas.draw_idle()
         self.has_data = True
+
+    def _finalize_axes(self, ax, *, show_legend: bool):
+        for spine in ("top", "right"):
+            if spine in ax.spines:
+                ax.spines[spine].set_visible(False)
+        for spine in ("bottom", "left"):
+            if spine in ax.spines:
+                ax.spines[spine].set_color("#c4ccdc")
+                ax.spines[spine].set_linewidth(0.8)
+        ax.tick_params(axis="both", colors="#2e3650", labelsize=9)
+        ax.set_facecolor("#ffffff")
+        legend = None
+        if show_legend:
+            handles, legend_labels = ax.get_legend_handles_labels()
+            if legend_labels:
+                legend = ax.legend(
+                    handles,
+                    legend_labels,
+                    loc="center left",
+                    bbox_to_anchor=(1.02, 0.5),
+                    frameon=False,
+                    fontsize=9,
+                    labelspacing=0.6,
+                )
+        ax.figure.set_facecolor("#f3f6fb")
+        if show_legend and legend is not None:
+            ax.figure.subplots_adjust(left=0.12, right=0.74, top=0.88, bottom=0.16)
+        else:
+            ax.figure.subplots_adjust(left=0.12, right=0.96, top=0.88, bottom=0.16)
 
     def save_dialog(self, parent: QWidget, suggested_name: str = "chart.png"):
         if not self.has_data:
@@ -312,7 +348,9 @@ class MainWindow(QMainWindow):
         self.sig = AppSignals()
 
         self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
         self.setCentralWidget(self.tabs)
+        self._apply_base_styles()
 
         file_menu = self.menuBar().addMenu("&File")
         self.action_save_settings = QAction("Save settings…", self)
@@ -343,11 +381,89 @@ class MainWindow(QMainWindow):
         self._series_color_cursor = 0
         self._chart_title_widgets: Dict[str, QLineEdit] = {}
         self._axis_format_combos: Dict[str, QComboBox] = {}
+        self._series_random_defaults: Dict[str, Tuple[int, int, float]] = {}
+        self._combo_style_cache: Dict[str, dict] = {}
 
         self._build_tabs()
         self._connect_signals()
         self._ensure_series_style_controls(["Primary", "Secondary"])
         self._update_combination_controls()
+
+    def _apply_base_styles(self):
+        self.setStyleSheet(
+            """
+            QMainWindow {
+                background-color: #e9edf4;
+            }
+            QWidget {
+                font-size: 11pt;
+            }
+            QTabWidget::pane {
+                border: 1px solid #c8cfdd;
+                border-radius: 6px;
+                background: #f9fbfe;
+            }
+            QTabBar::tab {
+                padding: 8px 18px;
+                background: #dfe5f1;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                color: #1a2132;
+            }
+            QScrollArea {
+                background: transparent;
+            }
+            QFrame[frameShape="StyledPanel"] {
+                background-color: #ffffff;
+                border: 1px solid #d4d9e2;
+                border-radius: 8px;
+            }
+            QPushButton {
+                background-color: #2f6fed;
+                color: #ffffff;
+                border-radius: 6px;
+                padding: 6px 14px;
+            }
+            QPushButton:hover:!disabled {
+                background-color: #255ad0;
+            }
+            QPushButton:disabled {
+                background-color: #b8c2d6;
+                color: #f3f4f8;
+            }
+            QLabel {
+                color: #1f2537;
+            }
+            QGroupBox {
+                border: 1px solid #d4d9e2;
+                border-radius: 8px;
+                margin-top: 12px;
+                background: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 16px;
+                padding: 0 4px;
+                background: transparent;
+            }
+            QToolButton {
+                background: transparent;
+                border: none;
+            }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+                background: #ffffff;
+                border: 1px solid #c8cfdd;
+                border-radius: 4px;
+                padding: 2px 6px;
+            }
+            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+                border: 1px solid #7b95f2;
+            }
+            """
+        )
 
     def _set_uniform_input_width(self, widget):
         widget.setMinimumWidth(140)
@@ -570,6 +686,22 @@ class MainWindow(QMainWindow):
 
     def _all_joint_combinations(self) -> List[Tuple[int, int, int]]:
         return list(combinations(range(len(self.joint_sets)), 3)) if len(self.joint_sets) >= 3 else []
+
+    def _compact_combo_label(self, label: str) -> str:
+        parts = [part.strip() for part in label.split("+") if part.strip()]
+        compact_parts: List[str] = []
+        for part in parts:
+            tokens = [tok for tok in part.replace("-", " ").split() if tok]
+            if len(tokens) >= 2:
+                abbrev = "".join(token[0].upper() for token in tokens[:3])
+                if len(abbrev) >= 2:
+                    compact_parts.append(abbrev)
+                    continue
+            if len(part) > 12:
+                compact_parts.append(part[:11] + "…")
+            else:
+                compact_parts.append(part)
+        return " / ".join(compact_parts) if compact_parts else label
 
     def _build_tabs(self):
         self.tabs.addTab(self._build_geology_tab(), "Geology")
@@ -1484,17 +1616,12 @@ class MainWindow(QMainWindow):
                     continue
                 xs_local, avg_line, min_line, max_line = envelope(stats_list)
                 primary_xs = xs_local
-                if multi_combo:
-                    base = f"Primary cumulative mass ({label})"
-                    primary_series.append((f"{base} – average", avg_line))
-                    primary_series.append((f"{base} – minimum", min_line))
-                    primary_series.append((f"{base} – maximum", max_line))
-                else:
-                    primary_series = [
-                        ("Primary cumulative mass (average)", avg_line),
-                        ("Primary cumulative mass (minimum)", min_line),
-                        ("Primary cumulative mass (maximum)", max_line),
-                    ]
+                compact = self._compact_combo_label(label)
+                prefix = "P"
+                primary_series.append((f"{prefix} avg – {compact}", avg_line))
+                primary_series.append((f"{prefix} min – {compact}", min_line))
+                primary_series.append((f"{prefix} max – {compact}", max_line))
+                if not multi_combo:
                     break
 
             secondary_series: List[Tuple[str, List[float]]] = []
@@ -1505,17 +1632,12 @@ class MainWindow(QMainWindow):
                     continue
                 xs_local, avg_line, min_line, max_line = envelope(stats_list)
                 secondary_xs = xs_local
-                if multi_combo:
-                    base = f"Secondary cumulative mass ({label})"
-                    secondary_series.append((f"{base} – average", avg_line))
-                    secondary_series.append((f"{base} – minimum", min_line))
-                    secondary_series.append((f"{base} – maximum", max_line))
-                else:
-                    secondary_series = [
-                        ("Secondary cumulative mass (average)", avg_line),
-                        ("Secondary cumulative mass (minimum)", min_line),
-                        ("Secondary cumulative mass (maximum)", max_line),
-                    ]
+                compact = self._compact_combo_label(label)
+                prefix = "S"
+                secondary_series.append((f"{prefix} avg – {compact}", avg_line))
+                secondary_series.append((f"{prefix} min – {compact}", min_line))
+                secondary_series.append((f"{prefix} max – {compact}", max_line))
+                if not multi_combo:
                     break
 
             def summarize(values: List[float]) -> Dict[str, float]:
@@ -1929,9 +2051,11 @@ class MainWindow(QMainWindow):
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
         base_label = QLabel(label)
         base_label.setMinimumWidth(180)
+        base_label.setStyleSheet("font-weight: 600; color: #1d2433;")
         layout.addWidget(base_label)
 
         name_edit = QLineEdit(label)
@@ -1942,20 +2066,28 @@ class MainWindow(QMainWindow):
         for color_name, color_value in MC_COLOR_OPTIONS:
             color_combo.addItem(color_name, color_value)
         default_color_index = self._preferred_color_index(label)
-        color_combo.setCurrentIndex(default_color_index)
         layout.addWidget(color_combo)
 
         dash_combo = QComboBox()
         for text, pattern in LINE_STYLE_OPTIONS:
             dash_combo.addItem(text, pattern)
-        dash_combo.setCurrentIndex(self._index_for_dash(self._default_dash_for_label(label)))
         layout.addWidget(dash_combo)
 
         width_spin = QDoubleSpinBox()
         width_spin.setRange(0.5, 8.0)
         width_spin.setSingleStep(0.1)
-        width_spin.setValue(self._default_width_for_label(label))
         layout.addWidget(width_spin)
+
+        if self._should_randomize_series(label):
+            color_idx, dash_idx, width_val = self._randomized_series_defaults(label)
+        else:
+            color_idx = default_color_index
+            dash_idx = self._index_for_dash(self._default_dash_for_label(label))
+            width_val = self._default_width_for_label(label)
+
+        color_combo.setCurrentIndex(color_idx)
+        dash_combo.setCurrentIndex(dash_idx)
+        width_spin.setValue(width_val)
 
         layout.addStretch(1)
         self._series_style_container.addWidget(row)
@@ -1993,23 +2125,85 @@ class MainWindow(QMainWindow):
             "linewidth": linewidth,
         }
 
+    def _should_randomize_series(self, label: str) -> bool:
+        text = label.lower()
+        return " – " in label and (text.startswith("p ") or text.startswith("s "))
+
+    def _series_combo_key(self, label: str) -> str:
+        if "–" in label:
+            _, _, tail = label.partition("–")
+            return tail.strip()
+        return label
+
+    def _combo_role_from_label(self, label: str) -> str:
+        text = label.lower()
+        if "avg" in text:
+            return "avg"
+        if " min" in text or "min " in text:
+            return "min"
+        if " max" in text or "max " in text:
+            return "max"
+        return "line"
+
+    def _randomized_series_defaults(self, label: str) -> Tuple[int, int, float]:
+        cached = self._series_random_defaults.get(label)
+        if cached:
+            return cached
+        combo_key = self._series_combo_key(label)
+        cache = self._combo_style_cache.get(combo_key)
+        if not cache:
+            seed = abs(hash(combo_key)) & 0xFFFFFFFF
+            rng = random.Random(seed)
+            color_choices = list(range(len(MC_COLOR_OPTIONS)))
+            if len(color_choices) > 2:
+                color_choices = color_choices[2:]
+            color_idx = color_choices[rng.randrange(len(color_choices))] if color_choices else 0
+            dash_palettes = [
+                {"avg": "-", "min": "--", "max": "-."},
+                {"avg": "-", "min": ":", "max": "--"},
+                {"avg": "-", "min": "--", "max": ":"},
+                {"avg": "-", "min": "-.", "max": ":"},
+            ]
+            palette = dash_palettes[rng.randrange(len(dash_palettes))]
+            cache = {"color": color_idx, "palette": palette, "seed": seed}
+            self._combo_style_cache[combo_key] = cache
+        role = self._combo_role_from_label(label)
+        palette = cache.get("palette", {})
+        dash = palette.get(role, "-")
+        role_seed = cache.get("seed", 0) + (hash(role) & 0xFFFF)
+        role_rng = random.Random(role_seed)
+        if role == "avg":
+            width = round(2.0 + role_rng.random() * 0.6, 1)
+        elif role == "min":
+            width = round(1.0 + role_rng.random() * 0.4, 1)
+        elif role == "max":
+            width = round(1.1 + role_rng.random() * 0.5, 1)
+        else:
+            width = round(1.3 + role_rng.random() * 0.4, 1)
+        dash_idx = self._index_for_dash(dash)
+        defaults = (cache.get("color", 0), dash_idx, width)
+        self._series_random_defaults[label] = defaults
+        return defaults
+
     def _default_dash_for_label(self, label: str) -> str:
         text = label.lower()
-        if "minimum" in text:
+        if "minimum" in text or " min" in text or text.endswith(" min"):
             return "--"
-        if "maximum" in text:
+        if "maximum" in text or " max" in text or text.endswith(" max"):
             return "-."
         return "-"
 
     def _default_width_for_label(self, label: str) -> float:
         text = label.lower()
-        if "average" in text:
+        if "average" in text or "avg" in text:
             return 2.0
-        if any(word in text for word in ("minimum", "maximum")):
+        if any(word in text for word in ("minimum", "maximum", " min", " max")):
             return 1.3
         return 1.5
 
     def _preferred_color_index(self, label: str) -> int:
+        if self._should_randomize_series(label):
+            return 0
         text = label.lower()
         if "primary" in text:
             if self._series_color_cursor < 2:
