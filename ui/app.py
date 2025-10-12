@@ -1,25 +1,187 @@
 from __future__ import annotations
 import json, os, random, statistics, threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, replace
-from typing import List
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from datetime import datetime
+from dataclasses import asdict
+from typing import Dict, List, Tuple
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QGridLayout, QLabel,
     QLineEdit, QPushButton, QFileDialog, QSpinBox, QDoubleSpinBox, QCheckBox, QMessageBox,
-    QHBoxLayout, QComboBox
+    QHBoxLayout, QComboBox, QGroupBox
 )
 from PySide6.QtCore import Signal, QObject, Qt
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
+from matplotlib.ticker import ScalarFormatter, StrMethodFormatter
 
 from ..engine.models import RockMass, JointSet, SpacingDist, CaveFace, Defaults, SecondaryRun, PrimaryBlock
 from ..engine.primary import generate_primary_blocks
 from ..engine.secondary import run_secondary, average_scatter_deg_from_jointsets
 from ..engine.hangup import orepass_hangups, kear_hangups
 from ..engine.io_formats import distributions_from_blocks, write_prm, write_sec
+
+
+def randomize_value(
+    value: float,
+    variation_pct: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    rng: random.Random | None = None,
+) -> float:
+    rng = rng or random
+    if variation_pct <= 0:
+        new_val = value
+    else:
+        delta = variation_pct / 100.0
+        new_val = value * (1.0 + rng.uniform(-delta, delta))
+    if minimum is not None:
+        new_val = max(minimum, new_val)
+    if maximum is not None:
+        new_val = min(maximum, new_val)
+    return new_val
+
+
+def randomize_joint_set(js: JointSet, variation_pct: float, rng: random.Random | None = None) -> JointSet:
+    rng = rng or random
+    spacing_vals = [
+        randomize_value(js.spacing.min, variation_pct, 0.01, rng=rng),
+        randomize_value(js.spacing.mean, variation_pct, 0.02, rng=rng),
+        randomize_value(js.spacing.max_or_90pct, variation_pct, 0.05, rng=rng),
+    ]
+    spacing_vals.sort()
+    spacing = SpacingDist(
+        js.spacing.type,
+        spacing_vals[0],
+        max(spacing_vals[0], spacing_vals[1]),
+        max(spacing_vals[1], spacing_vals[2])
+    )
+    return JointSet(
+        name=js.name,
+        mean_dip=randomize_value(js.mean_dip, variation_pct, 0.0, 90.0, rng=rng),
+        dip_range=randomize_value(js.dip_range, variation_pct, 0.0, 90.0, rng=rng),
+        mean_dip_dir=randomize_value(js.mean_dip_dir, variation_pct, 0.0, 360.0, rng=rng),
+        dip_dir_range=randomize_value(js.dip_dir_range, variation_pct, 0.0, 180.0, rng=rng),
+        spacing=spacing,
+        JC=int(round(randomize_value(js.JC, variation_pct, 0, 40, rng=rng)))
+    )
+
+
+MC_COLOR_OPTIONS: List[Tuple[str, str]] = [
+    ("Blue", "#1f77b4"),
+    ("Orange", "#ff7f0e"),
+    ("Green", "#2ca02c"),
+    ("Red", "#d62728"),
+    ("Purple", "#9467bd"),
+    ("Brown", "#8c564b"),
+    ("Pink", "#e377c2"),
+    ("Gray", "#7f7f7f"),
+    ("Olive", "#bcbd22"),
+    ("Cyan", "#17becf"),
+    ("Black", "#000000"),
+]
+
+LINE_STYLE_OPTIONS: List[Tuple[str, str]] = [
+    ("Solid", "-"),
+    ("Dashed", "--"),
+    ("Dotted", ":"),
+    ("Dash-dot", "-.")
+]
+
+
+def _monte_carlo_worker(
+    seed: int,
+    nblocks: int,
+    variation: float,
+    base_inputs: Dict[str, object],
+) -> Tuple[dict, dict]:
+    rng = random.Random(seed)
+
+    rock_dict = base_inputs.get("rock", {})
+    rock = RockMass(
+        rock_type=rock_dict.get("rock_type", "Unknown"),
+        MRMR=randomize_value(rock_dict.get("MRMR", 65.0), variation, 0.0, 100.0, rng=rng),
+        IRS=randomize_value(rock_dict.get("IRS", 120.0), variation, 1.0, 500.0, rng=rng),
+        IBS=rock_dict.get("IBS"),
+        mi=randomize_value(rock_dict.get("mi", 17.0), variation, 1.0, 50.0, rng=rng),
+        frac_freq=randomize_value(rock_dict.get("frac_freq", 0.0), variation, 0.0, 20.0, rng=rng),
+        frac_condition=int(round(randomize_value(rock_dict.get("frac_condition", 20), variation, 0, 40, rng=rng))),
+        density=randomize_value(rock_dict.get("density", 3200.0), variation, 1500.0, 4500.0, rng=rng),
+    )
+
+    joint_sets = []
+    for js_dict in base_inputs.get("joint_sets", []):
+        spacing_dict = js_dict.get("spacing", {})
+        spacing = SpacingDist(
+            spacing_dict.get("type", "trunc_exp"),
+            spacing_dict.get("min", 0.3),
+            spacing_dict.get("mean", 1.0),
+            spacing_dict.get("max_or_90pct", 3.0),
+            spacing_dict.get("max_obs"),
+        )
+        js = JointSet(
+            name=js_dict.get("name", "Set"),
+            mean_dip=js_dict.get("mean_dip", 45.0),
+            dip_range=js_dict.get("dip_range", 10.0),
+            mean_dip_dir=js_dict.get("mean_dip_dir", 0.0),
+            dip_dir_range=js_dict.get("dip_dir_range", 20.0),
+            spacing=spacing,
+            JC=js_dict.get("JC", 20),
+        )
+        joint_sets.append(randomize_joint_set(js, variation, rng=rng))
+
+    cave_dict = base_inputs.get("cave", {})
+    cave = CaveFace(
+        dip=cave_dict.get("dip", 45.0),
+        dip_dir=cave_dict.get("dip_dir", 0.0),
+        stress_dip=cave_dict.get("stress_dip", 5.0),
+        stress_strike=cave_dict.get("stress_strike", 5.0),
+        stress_normal=cave_dict.get("stress_normal", 0.0),
+        allow_stress_fractures=cave_dict.get("allow_stress_fractures", True),
+        spalling_pct=randomize_value(cave_dict.get("spalling_pct", 0.0), variation, 0.0, 100.0, rng=rng),
+    )
+
+    defaults_dict = base_inputs.get("defaults", {})
+    defaults = Defaults(
+        LHD_cutoff_m3=randomize_value(defaults_dict.get("LHD_cutoff_m3", 2.0), variation, 0.1, 50.0, rng=rng),
+        seed=rng.randint(0, 10**9),
+        arching_pct=randomize_value(defaults_dict.get("arching_pct", 0.12), variation, 0.0, 1.0, rng=rng),
+        arch_stress_conc=randomize_value(defaults_dict.get("arch_stress_conc", 25.0), variation, 1.0, 100.0, rng=rng),
+        stress_frac_trace_min=defaults_dict.get("stress_frac_trace_min", 10.0),
+        stress_frac_trace_mean=defaults_dict.get("stress_frac_trace_mean", 20.0),
+        stress_frac_trace_max=defaults_dict.get("stress_frac_trace_max", 30.0),
+        tension_factor=defaults_dict.get("tension_factor", 0.0),
+    )
+
+    secondary_dict = base_inputs.get("secondary", {})
+    secondary_params = SecondaryRun(
+        draw_height=randomize_value(secondary_dict.get("draw_height", 150.0), variation, 1.0, 2000.0, rng=rng),
+        max_caving_height=randomize_value(secondary_dict.get("max_caving_height", 300.0), variation, 1.0, 5000.0, rng=rng),
+        swell_factor=randomize_value(secondary_dict.get("swell_factor", 1.2), variation, 1.0, 3.0, rng=rng),
+        active_draw_width=randomize_value(secondary_dict.get("active_draw_width", 45.0), variation, 1.0, 200.0, rng=rng),
+        added_fines_pct=randomize_value(secondary_dict.get("added_fines_pct", 0.0), variation, 0.0, 80.0, rng=rng),
+        rate_cm_day=randomize_value(secondary_dict.get("rate_cm_day", 20.0), variation, 0.0, 100.0, rng=rng),
+        drawbell_upper_width=randomize_value(secondary_dict.get("drawbell_upper_width", 8.0), variation, 1.0, 50.0, rng=rng),
+        drawbell_lower_width=randomize_value(secondary_dict.get("drawbell_lower_width", 6.0), variation, 1.0, 50.0, rng=rng),
+    )
+
+    blocks = generate_primary_blocks(nblocks, rock, joint_sets, cave, defaults, seed=defaults.seed)
+    primary_stats = distributions_from_blocks(blocks)
+    mu = average_scatter_deg_from_jointsets(joint_sets)
+    primary_fines_ratio = cave.spalling_pct / 100.0
+    sec_blocks, _ = run_secondary(
+        blocks,
+        rock,
+        secondary_params,
+        defaults,
+        mu_scatter_deg=mu,
+        primary_fines_ratio=primary_fines_ratio,
+    )
+    secondary_stats = distributions_from_blocks(sec_blocks)
+    return primary_stats, secondary_stats
+
 
 class PlotWidget(QWidget):
     def __init__(self, parent=None):
@@ -50,8 +212,19 @@ class PlotWidget(QWidget):
         self.canvas.draw_idle()
         self.has_data = True
 
-    def plot_lines(self, xs: List[float] | List[List[float]], ys_list: List[List[float]], labels: List[str] | None = None,
-                   title: str = "", xlabel: str = "", ylabel: str = "", logx: bool = False):
+    def plot_lines(
+        self,
+        xs: List[float] | List[List[float]],
+        ys_list: List[List[float]],
+        labels: List[str] | None = None,
+        title: str = "",
+        xlabel: str = "",
+        ylabel: str = "",
+        logx: bool = False,
+        styles: List[Dict[str, object]] | None = None,
+        x_formatter=None,
+        y_formatter=None,
+    ):
         self.fig.clear()
         ax = self.fig.add_subplot(111)
         if ys_list:
@@ -64,15 +237,24 @@ class PlotWidget(QWidget):
         for i, ys in enumerate(ys_list):
             label = labels[i] if labels and i < len(labels) else None
             cur_xs = xs_list[i] if i < len(xs_list) else xs_list[0] if xs_list else []
-            ax.plot(cur_xs, ys, label=label)
+            style = styles[i] if styles and i < len(styles) else {}
+            display_label = style.get("label") if isinstance(style, dict) and style.get("label") else label
+            color = style.get("color") if isinstance(style, dict) else None
+            linestyle = style.get("linestyle") if isinstance(style, dict) and style.get("linestyle") else "-"
+            linewidth = style.get("linewidth") if isinstance(style, dict) and style.get("linewidth") else 1.5
+            ax.plot(cur_xs, ys, label=display_label, color=color, linestyle=linestyle, linewidth=linewidth)
         if logx:
             ax.set_xscale("log")
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.set_title(title)
         ax.grid(True, which="both", linestyle=":")
-        if labels:
+        if labels or (styles and any(isinstance(style, dict) and style.get("label") for style in (styles or []))):
             ax.legend()
+        if x_formatter is not None:
+            ax.xaxis.set_major_formatter(x_formatter)
+        if y_formatter is not None:
+            ax.yaxis.set_major_formatter(y_formatter)
         self.canvas.draw_idle()
         self.has_data = True
 
@@ -293,6 +475,33 @@ class MainWindow(QMainWindow):
         toggle_row.addStretch(1)
         plot_layout.addLayout(toggle_row)
 
+        style_group = QGroupBox("Chart styling")
+        style_layout = QVBoxLayout(style_group)
+        title_row = QHBoxLayout()
+        title_row.addWidget(QLabel("Title"))
+        self.mc_title_edit = QLineEdit("Monte Carlo cumulative mass envelopes")
+        title_row.addWidget(self.mc_title_edit)
+        style_layout.addLayout(title_row)
+
+        axis_row = QHBoxLayout()
+        axis_row.addWidget(QLabel("X-axis format"))
+        self.mc_xformat_combo = QComboBox()
+        self.mc_xformat_combo.addItems(["Auto", "0", "0.0", "0.00", "Scientific (1eX)"])
+        axis_row.addWidget(self.mc_xformat_combo)
+        axis_row.addSpacing(12)
+        axis_row.addWidget(QLabel("Y-axis format"))
+        self.mc_yformat_combo = QComboBox()
+        self.mc_yformat_combo.addItems(["Auto", "0", "0.0", "0.00", "Scientific (1eX)"])
+        axis_row.addWidget(self.mc_yformat_combo)
+        axis_row.addStretch(1)
+        style_layout.addLayout(axis_row)
+
+        style_layout.addWidget(QLabel("Series styling"))
+        self.mc_series_container = QVBoxLayout()
+        style_layout.addLayout(self.mc_series_container)
+        style_layout.addStretch(1)
+        plot_layout.addWidget(style_group)
+
         self.plot_monte_carlo = PlotWidget()
         plot_layout.addWidget(self.plot_monte_carlo)
         btn_row = QHBoxLayout(); btn_row.addStretch(1)
@@ -306,6 +515,9 @@ class MainWindow(QMainWindow):
         self.lbl_mc_stats = QLabel("Monte Carlo: -")
         plot_layout.addWidget(self.lbl_mc_stats)
         layout.addLayout(plot_layout, 1)
+
+        self._mc_style_widgets: Dict[str, Dict[str, QWidget]] = {}
+        self._mc_color_cursor = 0
 
         return w
 
@@ -330,6 +542,9 @@ class MainWindow(QMainWindow):
         self.btn_save_mc_report.clicked.connect(self.on_save_monte_carlo_report)
         self.chk_show_primary.toggled.connect(self._refresh_monte_carlo_plot)
         self.chk_show_secondary.toggled.connect(self._refresh_monte_carlo_plot)
+        self.mc_title_edit.textChanged.connect(self._refresh_monte_carlo_plot)
+        self.mc_xformat_combo.currentIndexChanged.connect(self._refresh_monte_carlo_plot)
+        self.mc_yformat_combo.currentIndexChanged.connect(self._refresh_monte_carlo_plot)
         self.sig.done_primary.connect(self.on_done_primary)
         self.sig.done_secondary.connect(self.on_done_secondary)
         self.sig.done_hangup.connect(self.on_done_hangup)
@@ -457,50 +672,6 @@ class MainWindow(QMainWindow):
     def on_done_hangup(self, stats: dict):
         self.lbl_hang.setText(f"Hang-ups → High: {stats['n_high']}  Low: {stats['n_low']}  Total hang-up tons (proxy): {stats['total_hangup_tons']:.1f} t")
 
-    def _randomize_value(
-        self,
-        value: float,
-        variation_pct: float,
-        minimum: float | None = None,
-        maximum: float | None = None,
-        rng: random.Random | None = None,
-    ):
-        rng = rng or random
-        if variation_pct <= 0:
-            new_val = value
-        else:
-            delta = variation_pct / 100.0
-            new_val = value * (1.0 + rng.uniform(-delta, delta))
-        if minimum is not None:
-            new_val = max(minimum, new_val)
-        if maximum is not None:
-            new_val = min(maximum, new_val)
-        return new_val
-
-    def _randomize_joint_set(self, js: JointSet, variation_pct: float, rng: random.Random | None = None) -> JointSet:
-        rng = rng or random
-        spacing_vals = [
-            self._randomize_value(js.spacing.min, variation_pct, 0.01, rng=rng),
-            self._randomize_value(js.spacing.mean, variation_pct, 0.02, rng=rng),
-            self._randomize_value(js.spacing.max_or_90pct, variation_pct, 0.05, rng=rng),
-        ]
-        spacing_vals.sort()
-        spacing = SpacingDist(
-            js.spacing.type,
-            spacing_vals[0],
-            max(spacing_vals[0], spacing_vals[1]),
-            max(spacing_vals[1], spacing_vals[2])
-        )
-        return JointSet(
-            name=js.name,
-            mean_dip=self._randomize_value(js.mean_dip, variation_pct, 0.0, 90.0, rng=rng),
-            dip_range=self._randomize_value(js.dip_range, variation_pct, 0.0, 90.0, rng=rng),
-            mean_dip_dir=self._randomize_value(js.mean_dip_dir, variation_pct, 0.0, 360.0, rng=rng),
-            dip_dir_range=self._randomize_value(js.dip_dir_range, variation_pct, 0.0, 180.0, rng=rng),
-            spacing=spacing,
-            JC=int(round(self._randomize_value(js.JC, variation_pct, 0, 40, rng=rng)))
-        )
-
     def on_run_monte_carlo(self):
         self.update_models_from_ui()
         runs = int(self.mc_runs.value())
@@ -531,66 +702,43 @@ class MainWindow(QMainWindow):
             secondary_results = []
             secondary_avg_volumes = []
             max_workers = max(1, min(runs, os.cpu_count() or 4))
+            base_inputs = dict(self._last_monte_carlo_inputs or {})
 
-            def run_single(_index: int):
-                seed = random.randint(0, 10**9)
-                rng = random.Random(seed)
-                rock = RockMass(
-                    rock_type=self.rock.rock_type,
-                    MRMR=self._randomize_value(self.rock.MRMR, variation, 0.0, 100.0, rng=rng),
-                    IRS=self._randomize_value(self.rock.IRS, variation, 1.0, 500.0, rng=rng),
-                    IBS=self.rock.IBS,
-                    mi=self._randomize_value(self.rock.mi, variation, 1.0, 50.0, rng=rng),
-                    frac_freq=self._randomize_value(self.rock.frac_freq, variation, 0.0, 20.0, rng=rng),
-                    frac_condition=int(round(self._randomize_value(self.rock.frac_condition, variation, 0, 40, rng=rng))),
-                    density=self._randomize_value(self.rock.density, variation, 1500.0, 4500.0, rng=rng),
-                )
-                joint_sets = [self._randomize_joint_set(js, variation, rng=rng) for js in self.joint_sets]
-                cave = replace(self.cave, spalling_pct=self._randomize_value(self.cave.spalling_pct, variation, 0.0, 100.0, rng=rng))
-                defaults = Defaults(
-                    LHD_cutoff_m3=self._randomize_value(self.defaults.LHD_cutoff_m3, variation, 0.1, 50.0, rng=rng),
-                    seed=rng.randint(0, 10**9),
-                    arching_pct=self._randomize_value(self.defaults.arching_pct, variation, 0.0, 1.0, rng=rng),
-                    arch_stress_conc=self._randomize_value(self.defaults.arch_stress_conc, variation, 1.0, 100.0, rng=rng),
-                )
-                secondary_params = SecondaryRun(
-                    draw_height=self._randomize_value(self.secondary.draw_height, variation, 1.0, 2000.0, rng=rng),
-                    max_caving_height=self._randomize_value(self.secondary.max_caving_height, variation, 1.0, 5000.0, rng=rng),
-                    swell_factor=self._randomize_value(self.secondary.swell_factor, variation, 1.0, 3.0, rng=rng),
-                    active_draw_width=self._randomize_value(self.secondary.active_draw_width, variation, 1.0, 200.0, rng=rng),
-                    added_fines_pct=self._randomize_value(self.secondary.added_fines_pct, variation, 0.0, 80.0, rng=rng),
-                    rate_cm_day=self._randomize_value(self.secondary.rate_cm_day, variation, 0.0, 100.0, rng=rng),
-                    drawbell_upper_width=self._randomize_value(self.secondary.drawbell_upper_width, variation, 1.0, 50.0, rng=rng),
-                    drawbell_lower_width=self._randomize_value(self.secondary.drawbell_lower_width, variation, 1.0, 50.0, rng=rng),
-                )
-                blocks = generate_primary_blocks(nblocks, rock, joint_sets, cave, defaults, seed=defaults.seed)
-                primary_stats = distributions_from_blocks(blocks)
-                mu = average_scatter_deg_from_jointsets(joint_sets)
-                primary_fines_ratio = cave.spalling_pct / 100.0
-                sec_blocks, _ = run_secondary(
-                    blocks,
-                    rock,
-                    secondary_params,
-                    defaults,
-                    mu_scatter_deg=mu,
-                    primary_fines_ratio=primary_fines_ratio,
-                )
+            def consume_result(primary_stats: dict, secondary_stats: dict):
+                primary_results.append(primary_stats)
+                primary_avg_volumes.append(primary_stats.get("avg_volume", 0.0))
+                secondary_results.append(secondary_stats)
+                secondary_avg_volumes.append(secondary_stats.get("avg_volume", 0.0))
 
-                class P:
-                    def __init__(self, b):
-                        self.V, self.Omega, self.joints_inside = b.V, b.Omega, b.joints_inside
+            seeds = [random.randint(0, 10**9) for _ in range(runs)]
 
-                sec_stats = distributions_from_blocks([P(b) for b in sec_blocks])
-                return primary_stats, sec_stats
-
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [executor.submit(run_single, i) for i in range(runs)]
-                for fut in as_completed(futures):
-                    primary_stats, sec_stats = fut.result()
-                    primary_results.append(primary_stats)
-                    primary_avg_volumes.append(primary_stats["avg_volume"])
-                    secondary_results.append(sec_stats)
-                    secondary_avg_volumes.append(sec_stats["avg_volume"])
+            if max_workers == 1:
+                for seed in seeds:
+                    primary_stats, sec_stats = _monte_carlo_worker(seed, nblocks, variation, base_inputs)
+                    consume_result(primary_stats, sec_stats)
+            else:
+                try:
+                    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                        futures = [
+                            executor.submit(_monte_carlo_worker, seed, nblocks, variation, base_inputs)
+                            for seed in seeds
+                        ]
+                        for fut in as_completed(futures):
+                            primary_stats, sec_stats = fut.result()
+                            consume_result(primary_stats, sec_stats)
+                except Exception as exc:
+                    try:
+                        self.sig.log.emit(f"Process pool failed ({exc}); falling back to threads.")
+                    except Exception:  # pragma: no cover - logging is best effort
+                        pass
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = [
+                            executor.submit(_monte_carlo_worker, seed, nblocks, variation, base_inputs)
+                            for seed in seeds
+                        ]
+                        for fut in as_completed(futures):
+                            primary_stats, sec_stats = fut.result()
+                            consume_result(primary_stats, sec_stats)
 
             if not primary_results:
                 return
@@ -649,6 +797,7 @@ class MainWindow(QMainWindow):
 
     def on_done_monte_carlo(self, result: dict):
         self._last_monte_carlo_result = result
+        self._ensure_monte_carlo_style_controls()
         self._refresh_monte_carlo_plot()
         info = result.get("info", {})
         p_info = info.get("primary", {})
@@ -673,6 +822,10 @@ class MainWindow(QMainWindow):
         xs_list: List[List[float]] = []
         lines: List[List[float]] = []
         labels: List[str] = []
+        styles: List[Dict[str, object]] = []
+
+        if result:
+            self._ensure_monte_carlo_style_controls()
 
         if result and self.chk_show_primary.isChecked():
             primary = result.get("primary") or {}
@@ -683,6 +836,7 @@ class MainWindow(QMainWindow):
                     xs_list.append(xs)
                     lines.append(values)
                     labels.append(label)
+                    styles.append(self._collect_series_style(label))
 
         if result and self.chk_show_secondary.isChecked():
             secondary = result.get("secondary") or {}
@@ -693,16 +847,23 @@ class MainWindow(QMainWindow):
                     xs_list.append(xs)
                     lines.append(values)
                     labels.append(label)
+                    styles.append(self._collect_series_style(label))
 
         if lines:
+            title_text = self.mc_title_edit.text().strip() if hasattr(self, "mc_title_edit") else ""
+            if not title_text:
+                title_text = "Monte Carlo cumulative mass envelopes"
             self.plot_monte_carlo.plot_lines(
                 xs_list,
                 lines,
                 labels=labels,
-                title="Monte Carlo cumulative mass envelopes",
+                title=title_text,
                 xlabel="Block volume (m³)",
                 ylabel="Cumulative mass (%)",
                 logx=True,
+                styles=styles,
+                x_formatter=self._axis_formatter_from_choice(self.mc_xformat_combo.currentText() if hasattr(self, "mc_xformat_combo") else "Auto"),
+                y_formatter=self._axis_formatter_from_choice(self.mc_yformat_combo.currentText() if hasattr(self, "mc_yformat_combo") else "Auto"),
             )
             self.btn_save_mc_plot.setEnabled(True)
         else:
@@ -718,45 +879,263 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Monte Carlo report",
-            "monte_carlo_report.json",
-            "JSON files (*.json);;Text files (*.txt);;All files (*)",
+            "monte_carlo_report.docx",
+            "Word document (*.docx);;All files (*)",
         )
         if not path:
+            return
+
+        if not path.lower().endswith(".docx"):
+            path += ".docx"
+
+        try:
+            from docx import Document
+            from docx.enum.text import WD_ALIGN_PARAGRAPH
+        except ImportError:
+            QMessageBox.critical(
+                self,
+                "Missing dependency",
+                "Saving Word reports requires the 'python-docx' package.\n"
+                "Install it with 'pip install python-docx' and try again.",
+            )
             return
 
         info = self._last_monte_carlo_result.get("info", {})
         primary = self._last_monte_carlo_result.get("primary") or {}
         secondary = self._last_monte_carlo_result.get("secondary") or {}
+        doc = Document()
+        doc.add_heading("Monte Carlo Fragmentation Report", 0)
+        subtitle = doc.add_paragraph(datetime.now().strftime("Generated on %Y-%m-%d at %H:%M"))
+        subtitle.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
-        def envelope_points(xs: List[float], label_values: List[tuple[str, List[float]]]):
-            points = []
-            for label, values in label_values:
-                points.append(
-                    {
-                        "label": label,
-                        "data": [
-                            {"block_volume_m3": vol, "cumulative_mass_pct": val}
-                            for vol, val in zip(xs, values)
-                        ],
-                    }
-                )
-            return points
+        doc.add_heading("Simulation summary", level=1)
+        summary_table = doc.add_table(rows=3, cols=4)
+        header_cells = summary_table.rows[0].cells
+        header_cells[0].text = "Stage"
+        header_cells[1].text = "Average volume (m³)"
+        header_cells[2].text = "Minimum (m³)"
+        header_cells[3].text = "Maximum (m³)"
 
-        report_payload = {
-            "simulation_settings": self._last_monte_carlo_settings,
-            "base_inputs": self._last_monte_carlo_inputs,
-            "summary": info,
-            "primary_envelope": envelope_points(primary.get("xs") or [], primary.get("series") or []),
-            "secondary_envelope": envelope_points(secondary.get("xs") or [], secondary.get("series") or []),
-        }
+        primary_row = summary_table.rows[1].cells
+        primary_row[0].text = "Primary"
+        primary_row[1].text = f"{info.get('primary', {}).get('mean_avg_volume', 0.0):.3f}"
+        primary_row[2].text = f"{info.get('primary', {}).get('min_avg_volume', 0.0):.3f}"
+        primary_row[3].text = f"{info.get('primary', {}).get('max_avg_volume', 0.0):.3f}"
+
+        secondary_row = summary_table.rows[2].cells
+        secondary_row[0].text = "Secondary"
+        secondary_row[1].text = f"{info.get('secondary', {}).get('mean_avg_volume', 0.0):.3f}"
+        secondary_row[2].text = f"{info.get('secondary', {}).get('min_avg_volume', 0.0):.3f}"
+        secondary_row[3].text = f"{info.get('secondary', {}).get('max_avg_volume', 0.0):.3f}"
+
+        doc.add_paragraph(
+            "Runs performed: {runs}  |  Blocks per run: {blocks}  |  Variation: ±{var:.1f}%".format(
+                runs=self._last_monte_carlo_settings.get("runs", 0),
+                blocks=self._last_monte_carlo_settings.get("blocks_per_run", 0),
+                var=self._last_monte_carlo_settings.get("variation_pct", 0.0),
+            )
+        )
+
+        doc.add_heading("Simulation settings", level=1)
+        settings_table = doc.add_table(rows=len(self._last_monte_carlo_settings) + 1, cols=2)
+        settings_table.rows[0].cells[0].text = "Setting"
+        settings_table.rows[0].cells[1].text = "Value"
+        for idx, (key, value) in enumerate(self._last_monte_carlo_settings.items(), start=1):
+            settings_table.rows[idx].cells[0].text = key.replace("_", " ").title()
+            settings_table.rows[idx].cells[1].text = str(value)
+
+        doc.add_heading("Base input snapshot", level=1)
+
+        def add_dict_table(title: str, payload: dict):
+            if not payload:
+                doc.add_paragraph(f"{title}: (not available)")
+                return
+            doc.add_paragraph(title, style="List Bullet")
+            table = doc.add_table(rows=len(payload) + 1, cols=2)
+            table.rows[0].cells[0].text = "Parameter"
+            table.rows[0].cells[1].text = "Value"
+            for idx, (key, value) in enumerate(payload.items(), start=1):
+                table.rows[idx].cells[0].text = key.replace("_", " ")
+                table.rows[idx].cells[1].text = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
+
+        base_inputs = self._last_monte_carlo_inputs or {}
+        add_dict_table("Rock mass", base_inputs.get("rock", {}))
+        add_dict_table("Cave face", base_inputs.get("cave", {}))
+        add_dict_table("Defaults", base_inputs.get("defaults", {}))
+        add_dict_table("Secondary fragmentation", base_inputs.get("secondary", {}))
+
+        joint_sets = base_inputs.get("joint_sets") or []
+        if joint_sets:
+            doc.add_heading("Joint sets", level=2)
+            for idx, js in enumerate(joint_sets, start=1):
+                doc.add_paragraph(f"Joint set {idx}: {js.get('name', 'Set')}", style="List Number")
+                js_table = doc.add_table(rows=len(js) + 1, cols=2)
+                js_table.rows[0].cells[0].text = "Parameter"
+                js_table.rows[0].cells[1].text = "Value"
+                for row_idx, (key, value) in enumerate(js.items(), start=1):
+                    js_table.rows[row_idx].cells[0].text = key.replace("_", " ")
+                    if isinstance(value, dict):
+                        js_table.rows[row_idx].cells[1].text = json.dumps(value, ensure_ascii=False)
+                    else:
+                        js_table.rows[row_idx].cells[1].text = str(value)
+
+        def add_envelope_section(title: str, xs: List[float], series: List[tuple[str, List[float]]]):
+            doc.add_heading(title, level=1)
+            if not xs or not series:
+                doc.add_paragraph("No data available.")
+                return
+            table = doc.add_table(rows=len(xs) + 1, cols=len(series) + 1)
+            table.rows[0].cells[0].text = "Block volume (m³)"
+            for idx, (label, _) in enumerate(series, start=1):
+                table.rows[0].cells[idx].text = label
+            for row_idx, vol in enumerate(xs, start=1):
+                table.rows[row_idx].cells[0].text = f"{vol:.4f}"
+                for col_idx, (_, values) in enumerate(series, start=1):
+                    try:
+                        table.rows[row_idx].cells[col_idx].text = f"{values[row_idx-1]:.3f}"
+                    except IndexError:
+                        table.rows[row_idx].cells[col_idx].text = "-"
+
+        add_envelope_section(
+            "Primary cumulative-mass envelope",
+            primary.get("xs") or [],
+            primary.get("series") or [],
+        )
+        add_envelope_section(
+            "Secondary cumulative-mass envelope",
+            secondary.get("xs") or [],
+            secondary.get("series") or [],
+        )
 
         try:
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(report_payload, fh, indent=2)
+            doc.save(path)
         except Exception as exc:  # pragma: no cover - UI feedback
             QMessageBox.critical(self, "Save failed", f"Could not save report:\n{exc}")
         else:
             QMessageBox.information(self, "Report saved", f"Monte Carlo report saved to:\n{path}")
+
+    def _ensure_monte_carlo_style_controls(self):
+        if not hasattr(self, "mc_series_container"):
+            return
+        result = self._last_monte_carlo_result or {}
+        labels = []
+        for key in ("primary", "secondary"):
+            series = (result.get(key) or {}).get("series") or []
+            labels.extend([label for label, _ in series])
+        existing = set(self._mc_style_widgets.keys())
+        for label in labels:
+            if label not in existing:
+                self._add_monte_carlo_style_row(label)
+        for label, widgets in self._mc_style_widgets.items():
+            container = widgets.get("container")
+            if container is not None:
+                container.setVisible(label in labels)
+
+    def _add_monte_carlo_style_row(self, label: str):
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        base_label = QLabel(label)
+        base_label.setMinimumWidth(180)
+        layout.addWidget(base_label)
+
+        name_edit = QLineEdit(label)
+        name_edit.setPlaceholderText("Legend label")
+        layout.addWidget(name_edit)
+
+        color_combo = QComboBox()
+        for color_name, color_value in MC_COLOR_OPTIONS:
+            color_combo.addItem(color_name, color_value)
+        default_color_index = self._mc_color_cursor % len(MC_COLOR_OPTIONS)
+        color_combo.setCurrentIndex(default_color_index)
+        self._mc_color_cursor += 1
+        layout.addWidget(color_combo)
+
+        dash_combo = QComboBox()
+        for text, pattern in LINE_STYLE_OPTIONS:
+            dash_combo.addItem(text, pattern)
+        dash_combo.setCurrentIndex(self._index_for_dash(self._default_dash_for_label(label)))
+        layout.addWidget(dash_combo)
+
+        width_spin = QDoubleSpinBox()
+        width_spin.setRange(0.5, 8.0)
+        width_spin.setSingleStep(0.1)
+        width_spin.setValue(self._default_width_for_label(label))
+        layout.addWidget(width_spin)
+
+        layout.addStretch(1)
+        self.mc_series_container.addWidget(row)
+        self._mc_style_widgets[label] = {
+            "container": row,
+            "name": name_edit,
+            "color": color_combo,
+            "dash": dash_combo,
+            "width": width_spin,
+        }
+        name_edit.textChanged.connect(self._refresh_monte_carlo_plot)
+        color_combo.currentIndexChanged.connect(self._refresh_monte_carlo_plot)
+        dash_combo.currentIndexChanged.connect(self._refresh_monte_carlo_plot)
+        width_spin.valueChanged.connect(self._refresh_monte_carlo_plot)
+
+    def _collect_series_style(self, label: str) -> Dict[str, object]:
+        widgets = self._mc_style_widgets.get(label)
+        if not widgets:
+            return {"label": label}
+        name_widget = widgets.get("name")
+        color_combo = widgets.get("color")
+        dash_combo = widgets.get("dash")
+        width_spin = widgets.get("width")
+        custom_label = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else label
+        if not custom_label:
+            custom_label = label
+        color = color_combo.currentData() if isinstance(color_combo, QComboBox) else None
+        linestyle = dash_combo.currentData() if isinstance(dash_combo, QComboBox) else "-"
+        linewidth = width_spin.value() if isinstance(width_spin, QDoubleSpinBox) else 1.5
+        return {
+            "label": custom_label,
+            "color": color,
+            "linestyle": linestyle or "-",
+            "linewidth": linewidth,
+        }
+
+    def _default_dash_for_label(self, label: str) -> str:
+        text = label.lower()
+        if "minimum" in text:
+            return "--"
+        if "maximum" in text:
+            return "-."
+        return "-"
+
+    def _default_width_for_label(self, label: str) -> float:
+        text = label.lower()
+        if "average" in text:
+            return 2.0
+        if any(word in text for word in ("minimum", "maximum")):
+            return 1.3
+        return 1.5
+
+    def _index_for_dash(self, dash: str) -> int:
+        for idx, (_, pattern) in enumerate(LINE_STYLE_OPTIONS):
+            if pattern == dash:
+                return idx
+        return 0
+
+    def _axis_formatter_from_choice(self, choice: str):
+        option = (choice or "Auto").strip()
+        if option == "Auto":
+            return None
+        if option == "0":
+            return StrMethodFormatter("{x:.0f}")
+        if option == "0.0":
+            return StrMethodFormatter("{x:.1f}")
+        if option == "0.00":
+            return StrMethodFormatter("{x:.2f}")
+        if option.startswith("Scientific"):
+            formatter = ScalarFormatter(useOffset=False, useMathText=True)
+            formatter.set_scientific(True)
+            formatter.set_powerlimits((-3, 4))
+            return formatter
+        return None
 
 def launch():
     app = QApplication([])
