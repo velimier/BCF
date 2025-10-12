@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple, Optional
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QGridLayout, QLabel,
     QLineEdit, QPushButton, QFileDialog, QSpinBox, QDoubleSpinBox, QCheckBox, QMessageBox,
-    QHBoxLayout, QComboBox, QGroupBox, QFrame, QScrollArea
+    QHBoxLayout, QComboBox, QGroupBox, QFrame, QScrollArea, QProgressBar
 )
 from PySide6.QtGui import QAction
 from PySide6.QtCore import Signal, QObject, Qt
@@ -339,6 +339,7 @@ class AppSignals(QObject):
     done_secondary = Signal(list, float, str)
     done_hangup = Signal(dict)
     done_monte_carlo = Signal(dict)
+    monte_carlo_progress = Signal(int, int)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -900,6 +901,12 @@ class MainWindow(QMainWindow):
         self.btn_save_mc_plot.setEnabled(False)
         btn_row.addWidget(self.btn_save_mc_plot)
         plot_layout.addLayout(btn_row)
+        self.mc_progress = QProgressBar()
+        self.mc_progress.setRange(0, 1)
+        self.mc_progress.setValue(0)
+        self.mc_progress.setFormat("Monte Carlo idle")
+        self.mc_progress.setVisible(False)
+        plot_layout.addWidget(self.mc_progress)
         self.lbl_mc_stats = QLabel("Monte Carlo: -")
         plot_layout.addWidget(self.lbl_mc_stats)
         layout.addLayout(plot_layout, 1)
@@ -986,6 +993,7 @@ class MainWindow(QMainWindow):
         self.sig.done_secondary.connect(self.on_done_secondary)
         self.sig.done_hangup.connect(self.on_done_hangup)
         self.sig.done_monte_carlo.connect(self.on_done_monte_carlo)
+        self.sig.monte_carlo_progress.connect(self.on_monte_carlo_progress)
 
     def update_models_from_ui(self):
         self.rock = RockMass(
@@ -1525,6 +1533,14 @@ class MainWindow(QMainWindow):
         self.btn_save_mc_report.setEnabled(False)
         self.lbl_mc_stats.setText("Monte Carlo: running…")
         self._refresh_monte_carlo_plot()
+        progress = getattr(self, "mc_progress", None)
+        if isinstance(progress, QProgressBar):
+            total = max(1, total_runs)
+            progress.setVisible(True)
+            progress.setRange(0, total)
+            progress.setValue(0)
+            progress.setFormat(f"0/{total_runs} runs" if total_runs else "Monte Carlo idle")
+        self.btn_run_monte_carlo.setEnabled(False)
 
         def work():
             primary_results: Dict[str, List[dict]] = defaultdict(list)
@@ -1542,13 +1558,21 @@ class MainWindow(QMainWindow):
                     tasks.append((seeds[seed_idx], spec))
                     seed_idx += 1
 
+            completed_runs = 0
+
             def consume_result(label: str, primary_stats: dict, secondary_stats: dict):
+                nonlocal completed_runs
                 if label not in combo_order:
                     combo_order.append(label)
                 primary_results[label].append(primary_stats)
                 primary_avg_volumes[label].append(primary_stats.get("avg_volume", 0.0))
                 secondary_results[label].append(secondary_stats)
                 secondary_avg_volumes[label].append(secondary_stats.get("avg_volume", 0.0))
+                completed_runs += 1
+                try:
+                    self.sig.monte_carlo_progress.emit(completed_runs, total_runs)
+                except Exception:  # pragma: no cover - best effort UI update
+                    pass
 
             if max_workers == 1:
                 for seed, spec in tasks:
@@ -1694,6 +1718,7 @@ class MainWindow(QMainWindow):
 
     def on_done_monte_carlo(self, result: dict):
         self._last_monte_carlo_result = result
+        self.btn_run_monte_carlo.setEnabled(True)
         labels = []
         for key in ("primary", "secondary"):
             series = (result.get(key) or {}).get("series") or []
@@ -1726,7 +1751,38 @@ class MainWindow(QMainWindow):
             )
         )
         self.lbl_mc_stats.setText(summary_text + combos_summary)
+        progress = getattr(self, "mc_progress", None)
+        if isinstance(progress, QProgressBar):
+            total_runs = info.get("runs") or 0
+            total_runs = int(total_runs)
+            if total_runs <= 0:
+                progress.setRange(0, 1)
+                progress.setValue(0)
+                progress.setFormat("Monte Carlo idle")
+            else:
+                progress.setRange(0, total_runs)
+                progress.setValue(total_runs)
+                progress.setFormat(f"Completed {total_runs}/{total_runs} runs")
         self.btn_save_mc_report.setEnabled(True)
+
+    def on_monte_carlo_progress(self, completed: int, total: int):
+        progress = getattr(self, "mc_progress", None)
+        if not isinstance(progress, QProgressBar):
+            return
+        total = max(0, int(total))
+        completed = max(0, int(completed))
+        if total <= 0:
+            progress.setRange(0, 1)
+            progress.setValue(0)
+            progress.setFormat("Monte Carlo idle")
+            progress.setVisible(False)
+            return
+        progress.setRange(0, total)
+        progress.setValue(min(completed, total))
+        progress.setFormat(f"{min(completed, total)}/{total} runs")
+        progress.setVisible(True)
+        if total > 0 and completed >= total:
+            self.btn_run_monte_carlo.setEnabled(True)
 
     def _refresh_all_plots(self):
         self._refresh_primary_plot()
