@@ -204,6 +204,10 @@ class PlotWidget(QWidget):
         self.fig = Figure(figsize=(6, 4))
         self.canvas = FigureCanvas(self.fig)
         self.toolbar = NavigationToolbar(self.canvas, self)
+        self._font_size = 9
+        self._grid_color = "#cfd6e6"
+        self._show_major_grid = True
+        self._show_minor_grid = True
         lay = QVBoxLayout()
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(8)
@@ -222,6 +226,51 @@ class PlotWidget(QWidget):
     def set_legend_enabled(self, enabled: bool):
         self._legend_enabled = bool(enabled)
 
+    def set_chart_appearance(
+        self,
+        *,
+        font_size: int | None = None,
+        grid_color: str | None = None,
+        show_major_grid: bool | None = None,
+        show_minor_grid: bool | None = None,
+    ):
+        if font_size is not None:
+            try:
+                font_size = int(font_size)
+            except (TypeError, ValueError):
+                pass
+            else:
+                self._font_size = max(6, min(int(font_size), 36))
+        if grid_color:
+            color_text = str(grid_color).strip()
+            if color_text:
+                try:
+                    self._grid_color = to_hex(color_text)
+                except ValueError:
+                    pass
+        if show_major_grid is not None:
+            self._show_major_grid = bool(show_major_grid)
+        if show_minor_grid is not None:
+            self._show_minor_grid = bool(show_minor_grid)
+
+    def _apply_grid(self, ax):
+        linewidth_major = 0.6
+        linewidth_minor = 0.4
+        ax.grid(
+            bool(self._show_major_grid),
+            which="major",
+            linestyle=":",
+            color=self._grid_color,
+            linewidth=linewidth_major,
+        )
+        ax.grid(
+            bool(self._show_minor_grid),
+            which="minor",
+            linestyle=":",
+            color=self._grid_color,
+            linewidth=linewidth_minor,
+        )
+
     def plot_distributions(self, prim_stats: dict, sec_stats: dict | None = None, title: str = ""):
         self.fig.clear()
         ax = self.fig.add_subplot(111)
@@ -233,7 +282,7 @@ class PlotWidget(QWidget):
         ax.set_xlabel("Block volume (m³)")
         ax.set_ylabel("Cumulative mass (%)")
         ax.set_title(title)
-        ax.grid(True, which="both", linestyle=":", color="#cfd6e6", linewidth=0.6)
+        self._apply_grid(ax)
         self._finalize_axes(ax, show_legend=True)
         self.canvas.draw_idle()
         self.has_data = True
@@ -291,7 +340,7 @@ class PlotWidget(QWidget):
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.set_title(title)
-        ax.grid(True, which="both", linestyle=":", color="#cfd6e6", linewidth=0.6)
+        self._apply_grid(ax)
         if envelopes:
             for env in envelopes:
                 env_xs = env.get("xs") if isinstance(env, dict) else None
@@ -351,7 +400,7 @@ class PlotWidget(QWidget):
             if spine in ax.spines:
                 ax.spines[spine].set_color("#c4ccdc")
                 ax.spines[spine].set_linewidth(0.8)
-        ax.tick_params(axis="both", colors="#2e3650", labelsize=9)
+        ax.tick_params(axis="both", colors="#2e3650", labelsize=self._font_size)
         ax.set_facecolor("#ffffff")
         effective_show = show_legend and self._legend_enabled
         legend = None
@@ -364,9 +413,16 @@ class PlotWidget(QWidget):
                     loc="center left",
                     bbox_to_anchor=(1.02, 0.5),
                     frameon=False,
-                    fontsize=9,
+                    fontsize=self._font_size,
                     labelspacing=0.6,
                 )
+        if ax.title:
+            ax.title.set_fontsize(self._font_size + 2)
+            ax.title.set_color("#1d2433")
+        ax.xaxis.label.set_fontsize(self._font_size + 1)
+        ax.yaxis.label.set_fontsize(self._font_size + 1)
+        ax.xaxis.label.set_color("#1d2433")
+        ax.yaxis.label.set_color("#1d2433")
         ax.figure.set_facecolor("#f3f6fb")
         if effective_show and legend is not None:
             ax.figure.subplots_adjust(left=0.12, right=0.74, top=0.88, bottom=0.16)
@@ -434,6 +490,10 @@ class MainWindow(QMainWindow):
 
         self._legend_enabled = True
         self._mc_use_shaded_envelope = False
+        self._chart_font_size = 9
+        self._chart_grid_color = "#cfd6e6"
+        self._chart_show_major_grid = True
+        self._chart_show_minor_grid = True
 
         self._series_style_widgets: Dict[str, Dict[str, QWidget]] = {}
         self._series_color_cursor = 0
@@ -443,11 +503,16 @@ class MainWindow(QMainWindow):
         self._series_random_defaults: Dict[str, Tuple[int, int, float]] = {}
         self._combo_style_cache: Dict[str, dict] = {}
         self._next_combo_color_index = 0
+        self._chart_font_spin: QSpinBox | None = None
+        self._chart_grid_color_combo: QComboBox | None = None
+        self._chart_major_grid_check: QCheckBox | None = None
+        self._chart_minor_grid_check: QCheckBox | None = None
 
         self._build_tabs()
         self._connect_signals()
         self._ensure_series_style_controls(["Primary", "Secondary"])
         self._update_combination_controls()
+        self._apply_chart_appearance_to_plots()
 
     def _apply_base_styles(self):
         self.setStyleSheet(
@@ -717,6 +782,21 @@ class MainWindow(QMainWindow):
         self._update_joint_combination_controls()
         self._update_monte_carlo_combination_controls()
 
+    def _apply_chart_appearance_to_plots(self):
+        appearance = {
+            "font_size": self._chart_font_size,
+            "grid_color": self._chart_grid_color,
+            "show_major_grid": self._chart_show_major_grid,
+            "show_minor_grid": self._chart_show_minor_grid,
+        }
+        for plot in (
+            getattr(self, "plot_primary", None),
+            getattr(self, "plot_secondary", None),
+            getattr(self, "plot_monte_carlo", None),
+        ):
+            if isinstance(plot, PlotWidget):
+                plot.set_chart_appearance(**appearance)
+
     def _selected_joint_combination_indexes(self) -> Optional[Tuple[int, int, int]]:
         combo = getattr(self, "combo_joint_combination", None)
         if not isinstance(combo, QComboBox):
@@ -855,6 +935,12 @@ class MainWindow(QMainWindow):
 
         plot_layout = QVBoxLayout()
         self.plot_primary = PlotWidget()
+        self.plot_primary.set_chart_appearance(
+            font_size=self._chart_font_size,
+            grid_color=self._chart_grid_color,
+            show_major_grid=self._chart_show_major_grid,
+            show_minor_grid=self._chart_show_minor_grid,
+        )
         self.plot_primary.set_legend_enabled(self._legend_enabled)
         plot_layout.addWidget(self.plot_primary)
         plot_layout.setStretch(plot_layout.indexOf(self.plot_primary), 1)
@@ -904,6 +990,12 @@ class MainWindow(QMainWindow):
 
         plot_layout = QVBoxLayout()
         self.plot_secondary = PlotWidget()
+        self.plot_secondary.set_chart_appearance(
+            font_size=self._chart_font_size,
+            grid_color=self._chart_grid_color,
+            show_major_grid=self._chart_show_major_grid,
+            show_minor_grid=self._chart_show_minor_grid,
+        )
         self.plot_secondary.set_legend_enabled(self._legend_enabled)
         plot_layout.addWidget(self.plot_secondary)
         plot_layout.setStretch(plot_layout.indexOf(self.plot_secondary), 1)
@@ -957,6 +1049,12 @@ class MainWindow(QMainWindow):
         plot_layout.addLayout(toggle_row)
 
         self.plot_monte_carlo = PlotWidget()
+        self.plot_monte_carlo.set_chart_appearance(
+            font_size=self._chart_font_size,
+            grid_color=self._chart_grid_color,
+            show_major_grid=self._chart_show_major_grid,
+            show_minor_grid=self._chart_show_minor_grid,
+        )
         self.plot_monte_carlo.set_legend_enabled(self._legend_enabled)
         plot_layout.addWidget(self.plot_monte_carlo)
         plot_layout.setStretch(plot_layout.indexOf(self.plot_monte_carlo), 1)
@@ -1021,6 +1119,49 @@ class MainWindow(QMainWindow):
         combo_x.currentIndexChanged.connect(self._refresh_all_plots)
         combo_y.currentIndexChanged.connect(self._refresh_all_plots)
         layout.addWidget(axis_group)
+
+        appearance_group = QGroupBox("Chart appearance")
+        appearance_layout = QGridLayout(appearance_group)
+        appearance_layout.addWidget(QLabel("Font size"), 0, 0)
+        font_spin = QSpinBox()
+        font_spin.setRange(6, 36)
+        font_spin.setValue(self._chart_font_size)
+        appearance_layout.addWidget(font_spin, 0, 1)
+        font_spin.valueChanged.connect(self._on_chart_font_size_changed)
+        self._chart_font_spin = font_spin
+
+        appearance_layout.addWidget(QLabel("Grid line color"), 1, 0)
+        grid_combo = QComboBox()
+        grid_combo.setEditable(True)
+        grid_combo.addItem("Soft blue-gray", "#cfd6e6")
+        for name, value in MC_COLOR_OPTIONS:
+            if value.lower() == "#cfd6e6":
+                continue
+            grid_combo.addItem(name, value)
+        if self._chart_grid_color:
+            idx = grid_combo.findData(self._chart_grid_color)
+            if idx >= 0:
+                grid_combo.setCurrentIndex(idx)
+            else:
+                grid_combo.setEditText(self._chart_grid_color)
+        grid_combo.currentIndexChanged.connect(self._on_chart_grid_color_changed)
+        grid_combo.editTextChanged.connect(self._on_chart_grid_color_changed)
+        appearance_layout.addWidget(grid_combo, 1, 1)
+        self._chart_grid_color_combo = grid_combo
+
+        major_check = QCheckBox("Show major grid lines")
+        major_check.setChecked(self._chart_show_major_grid)
+        major_check.toggled.connect(self._on_toggle_major_grid)
+        appearance_layout.addWidget(major_check, 2, 0, 1, 2)
+        self._chart_major_grid_check = major_check
+
+        minor_check = QCheckBox("Show minor grid lines")
+        minor_check.setChecked(self._chart_show_minor_grid)
+        minor_check.toggled.connect(self._on_toggle_minor_grid)
+        appearance_layout.addWidget(minor_check, 3, 0, 1, 2)
+        self._chart_minor_grid_check = minor_check
+
+        layout.addWidget(appearance_group)
 
         limit_group = QGroupBox("Axis limits")
         limit_layout = QGridLayout(limit_group)
@@ -1250,6 +1391,12 @@ class MainWindow(QMainWindow):
                 label: self._collect_series_style(label)
                 for label in list(self._series_style_widgets.keys())
             },
+            "chart_appearance": {
+                "font_size": self._chart_font_size,
+                "grid_color": self._chart_grid_color,
+                "show_major_grid": self._chart_show_major_grid,
+                "show_minor_grid": self._chart_show_minor_grid,
+            },
         }
         return state
 
@@ -1472,6 +1619,53 @@ class MainWindow(QMainWindow):
             for plot in (getattr(self, "plot_primary", None), getattr(self, "plot_secondary", None), getattr(self, "plot_monte_carlo", None)):
                 if isinstance(plot, PlotWidget):
                     plot.set_legend_enabled(self._legend_enabled)
+
+        appearance_state = state.get("chart_appearance")
+        if isinstance(appearance_state, dict):
+            font_size = appearance_state.get("font_size")
+            if font_size is not None:
+                try:
+                    parsed = int(float(font_size))
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    self._chart_font_size = max(6, min(parsed, 36))
+                    if isinstance(self._chart_font_spin, QSpinBox):
+                        prev = self._chart_font_spin.blockSignals(True)
+                        self._chart_font_spin.setValue(self._chart_font_size)
+                        self._chart_font_spin.blockSignals(prev)
+            color = appearance_state.get("grid_color")
+            if isinstance(color, str) and color.strip():
+                try:
+                    resolved = to_hex(color)
+                except ValueError:
+                    pass
+                else:
+                    self._chart_grid_color = resolved
+                    combo = self._chart_grid_color_combo
+                    if isinstance(combo, QComboBox):
+                        idx = combo.findData(resolved)
+                        prev = combo.blockSignals(True)
+                        if idx >= 0:
+                            combo.setCurrentIndex(idx)
+                        elif combo.isEditable():
+                            combo.setEditText(resolved)
+                        combo.blockSignals(prev)
+            major = appearance_state.get("show_major_grid")
+            if major is not None:
+                self._chart_show_major_grid = bool(major)
+                if isinstance(self._chart_major_grid_check, QCheckBox):
+                    prev = self._chart_major_grid_check.blockSignals(True)
+                    self._chart_major_grid_check.setChecked(self._chart_show_major_grid)
+                    self._chart_major_grid_check.blockSignals(prev)
+            minor = appearance_state.get("show_minor_grid")
+            if minor is not None:
+                self._chart_show_minor_grid = bool(minor)
+                if isinstance(self._chart_minor_grid_check, QCheckBox):
+                    prev = self._chart_minor_grid_check.blockSignals(True)
+                    self._chart_minor_grid_check.setChecked(self._chart_show_minor_grid)
+                    self._chart_minor_grid_check.blockSignals(prev)
+            self._apply_chart_appearance_to_plots()
 
         series_styles = state.get("series_styles")
         if isinstance(series_styles, dict):
@@ -1987,6 +2181,7 @@ class MainWindow(QMainWindow):
             self.btn_run_monte_carlo.setEnabled(True)
 
     def _refresh_all_plots(self):
+        self._apply_chart_appearance_to_plots()
         self._refresh_primary_plot()
         self._refresh_secondary_plot()
         self._refresh_monte_carlo_plot()
@@ -1996,6 +2191,53 @@ class MainWindow(QMainWindow):
         for plot in (getattr(self, "plot_primary", None), getattr(self, "plot_secondary", None), getattr(self, "plot_monte_carlo", None)):
             if isinstance(plot, PlotWidget):
                 plot.set_legend_enabled(self._legend_enabled)
+        self._refresh_all_plots()
+
+    def _on_chart_font_size_changed(self, value: int):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return
+        self._chart_font_size = max(6, min(parsed, 36))
+        self._apply_chart_appearance_to_plots()
+        self._refresh_all_plots()
+
+    def _chart_grid_color_value(self) -> str:
+        combo = self._chart_grid_color_combo
+        if isinstance(combo, QComboBox):
+            data = combo.currentData()
+            if isinstance(data, str) and data:
+                return data
+            text = combo.currentText().strip()
+            if text:
+                return text
+        return self._chart_grid_color
+
+    def _on_chart_grid_color_changed(self, *args):  # noqa: ARG002 - Qt signal payload ignored
+        color = self._chart_grid_color_value()
+        try:
+            resolved = to_hex(color)
+        except ValueError:
+            return
+        self._chart_grid_color = resolved
+        combo = self._chart_grid_color_combo
+        if isinstance(combo, QComboBox) and combo.isEditable():
+            data = combo.currentData()
+            if not isinstance(data, str) or not data:
+                prev = combo.blockSignals(True)
+                combo.setEditText(resolved)
+                combo.blockSignals(prev)
+        self._apply_chart_appearance_to_plots()
+        self._refresh_all_plots()
+
+    def _on_toggle_major_grid(self, checked: bool):
+        self._chart_show_major_grid = bool(checked)
+        self._apply_chart_appearance_to_plots()
+        self._refresh_all_plots()
+
+    def _on_toggle_minor_grid(self, checked: bool):
+        self._chart_show_minor_grid = bool(checked)
+        self._apply_chart_appearance_to_plots()
         self._refresh_all_plots()
 
     def _refresh_primary_plot(self):
