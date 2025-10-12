@@ -10,8 +10,9 @@ from typing import Dict, List, Tuple, Optional
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QGridLayout, QLabel,
     QLineEdit, QPushButton, QFileDialog, QSpinBox, QDoubleSpinBox, QCheckBox, QMessageBox,
-    QHBoxLayout, QComboBox, QGroupBox, QFrame
+    QHBoxLayout, QComboBox, QGroupBox, QFrame, QScrollArea
 )
+from PySide6.QtGui import QAction
 from PySide6.QtCore import Signal, QObject, Qt
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -313,6 +314,12 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
 
+        file_menu = self.menuBar().addMenu("&File")
+        self.action_save_settings = QAction("Save settings…", self)
+        self.action_load_settings = QAction("Load settings…", self)
+        file_menu.addAction(self.action_save_settings)
+        file_menu.addAction(self.action_load_settings)
+
         self.rock = RockMass()
         self.joint_sets: List[JointSet] = [
             JointSet("Set1", 60, 20, 90, 20, SpacingDist("trunc_exp",0.3,1.0,3.0), 20),
@@ -447,6 +454,12 @@ class MainWindow(QMainWindow):
         self.joint_widgets.append(entry)
         if hasattr(self, "joint_sets_container"):
             self.joint_sets_container.addWidget(frame)
+        if not suppress_update and hasattr(self, "joint_sets_scroll"):
+            scroll = getattr(self, "joint_sets_scroll", None)
+            if isinstance(scroll, QScrollArea):
+                bar = scroll.verticalScrollBar()
+                if bar is not None:
+                    bar.setValue(bar.maximum())
         self._refresh_joint_remove_buttons()
         if not suppress_update:
             self._update_combination_controls()
@@ -462,6 +475,21 @@ class MainWindow(QMainWindow):
         if isinstance(frame, QWidget):
             frame.setParent(None)
             frame.deleteLater()
+        self._refresh_joint_remove_buttons()
+        self._update_combination_controls()
+
+    def _clear_joint_set_widgets(self):
+        for entry in getattr(self, "joint_widgets", []):
+            frame = entry.get("frame")
+            if isinstance(frame, QWidget):
+                frame.setParent(None)
+                frame.deleteLater()
+        self.joint_widgets = []
+
+    def _rebuild_joint_set_widgets(self, joint_sets: List[JointSet]):
+        self._clear_joint_set_widgets()
+        for js in joint_sets:
+            self._add_joint_set_widget(js, suppress_update=True)
         self._refresh_joint_remove_buttons()
         self._update_combination_controls()
 
@@ -572,7 +600,12 @@ class MainWindow(QMainWindow):
         self.joint_sets_container.setContentsMargins(0, 0, 0, 0)
         self.joint_sets_container.setSpacing(12)
         joint_sets_widget.setLayout(self.joint_sets_container)
-        g.addWidget(joint_sets_widget, row, 0, 1, 4)
+        self.joint_sets_scroll = QScrollArea()
+        self.joint_sets_scroll.setWidgetResizable(True)
+        self.joint_sets_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.joint_sets_scroll.setFrameShape(QFrame.NoFrame)
+        self.joint_sets_scroll.setWidget(joint_sets_widget)
+        g.addWidget(self.joint_sets_scroll, row, 0, 1, 4)
         row += 1
         for js in self.joint_sets:
             self._add_joint_set_widget(js, suppress_update=True)
@@ -815,6 +848,8 @@ class MainWindow(QMainWindow):
         self.btn_save_mc_report.clicked.connect(self.on_save_monte_carlo_report)
         self.chk_show_primary.toggled.connect(self._refresh_monte_carlo_plot)
         self.chk_show_secondary.toggled.connect(self._refresh_monte_carlo_plot)
+        self.action_save_settings.triggered.connect(self.on_save_settings)
+        self.action_load_settings.triggered.connect(self.on_load_settings)
         self.sig.done_primary.connect(self.on_done_primary)
         self.sig.done_secondary.connect(self.on_done_secondary)
         self.sig.done_hangup.connect(self.on_done_hangup)
@@ -885,6 +920,306 @@ class MainWindow(QMainWindow):
             drawbell_upper_width=self.upper_w.value(),
             drawbell_lower_width=self.lower_w.value(),
         )
+
+    def _current_mc_selection(self) -> Optional[Tuple[str, Optional[Tuple[int, int, int]]]]:
+        combo = getattr(self, "combo_mc_combinations", None)
+        if isinstance(combo, QComboBox):
+            data = combo.currentData()
+            if isinstance(data, tuple) and len(data) == 2:
+                mode, indexes = data
+                if indexes is not None:
+                    indexes = tuple(indexes)
+                return mode, indexes
+        return None
+
+    def _serialize_mc_selection(self) -> Optional[dict]:
+        selection = self._current_mc_selection()
+        if not selection:
+            return None
+        mode, indexes = selection
+        return {"mode": mode, "indexes": list(indexes) if indexes is not None else None}
+
+    def _apply_mc_selection(self, selection: Optional[dict]):
+        combo = getattr(self, "combo_mc_combinations", None)
+        if not isinstance(combo, QComboBox):
+            return
+        if not selection:
+            combo.setCurrentIndex(0)
+            return
+        mode = selection.get("mode")
+        indexes = selection.get("indexes")
+        if isinstance(indexes, list):
+            indexes = tuple(int(i) for i in indexes)
+        target = (mode, indexes if indexes is not None else None)
+        idx = combo.findData(target)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        else:
+            combo.setCurrentIndex(0)
+
+    def _gather_settings_state(self) -> dict:
+        self.update_models_from_ui()
+        selected_combo = self._selected_joint_combination_indexes()
+        state = {
+            "rock": asdict(self.rock),
+            "joint_sets": [asdict(js) for js in self.joint_sets],
+            "cave": asdict(self.cave),
+            "defaults": asdict(self.defaults),
+            "secondary": asdict(self.secondary),
+            "primary": {"nblocks": int(self.nblocks.value()) if hasattr(self, "nblocks") else None},
+            "monte_carlo": {
+                "runs": int(self.mc_runs.value()) if hasattr(self, "mc_runs") else None,
+                "blocks_per_run": int(self.mc_blocks.value()) if hasattr(self, "mc_blocks") else None,
+                "variation_pct": float(self.mc_variation.value()) if hasattr(self, "mc_variation") else None,
+                "selection": self._serialize_mc_selection(),
+            },
+            "selected_joint_combination": list(selected_combo) if selected_combo else None,
+            "chart_titles": {
+                key: widget.text()
+                for key, widget in self._chart_title_widgets.items()
+                if isinstance(widget, QLineEdit)
+            },
+            "axis_formats": {
+                axis: combo.currentText()
+                for axis, combo in self._axis_format_combos.items()
+                if isinstance(combo, QComboBox)
+            },
+            "series_styles": {
+                label: self._collect_series_style(label)
+                for label in list(self._series_style_widgets.keys())
+            },
+        }
+        return state
+
+    def _apply_series_style(self, label: str, style: dict):
+        if not style:
+            return
+        self._ensure_series_style_controls([label])
+        widgets = self._series_style_widgets.get(label)
+        if not widgets:
+            return
+        name_widget = widgets.get("name")
+        color_combo = widgets.get("color")
+        dash_combo = widgets.get("dash")
+        width_spin = widgets.get("width")
+        if isinstance(name_widget, QLineEdit) and "label" in style:
+            prev = name_widget.blockSignals(True)
+            name_widget.setText(str(style.get("label", label)))
+            name_widget.blockSignals(prev)
+        if isinstance(color_combo, QComboBox) and "color" in style:
+            idx = color_combo.findData(style.get("color"))
+            if idx >= 0:
+                prev = color_combo.blockSignals(True)
+                color_combo.setCurrentIndex(idx)
+                color_combo.blockSignals(prev)
+        if isinstance(dash_combo, QComboBox) and "linestyle" in style:
+            idx = dash_combo.findData(style.get("linestyle"))
+            if idx >= 0:
+                prev = dash_combo.blockSignals(True)
+                dash_combo.setCurrentIndex(idx)
+                dash_combo.blockSignals(prev)
+        if isinstance(width_spin, QDoubleSpinBox) and "linewidth" in style:
+            prev = width_spin.blockSignals(True)
+            width_spin.setValue(float(style.get("linewidth", width_spin.value())))
+            width_spin.blockSignals(prev)
+
+    def _update_ui_from_models(self):
+        self.rock_type.setText(self.rock.rock_type)
+        self.mrmr.setValue(self.rock.MRMR)
+        self.irs.setValue(self.rock.IRS)
+        self.mi.setValue(self.rock.mi)
+        self.ff.setValue(self.rock.frac_freq)
+        self.fc.setValue(self.rock.frac_condition)
+        self.density.setValue(self.rock.density)
+
+        self._rebuild_joint_set_widgets(self.joint_sets)
+
+        self.cave_dip.setValue(self.cave.dip)
+        self.cave_ddir.setValue(self.cave.dip_dir)
+        self.st_dip.setValue(self.cave.stress_dip)
+        self.st_strike.setValue(self.cave.stress_strike)
+        self.st_norm.setValue(self.cave.stress_normal)
+        self.allow_sf.setChecked(self.cave.allow_stress_fractures)
+        self.spalling.setValue(self.cave.spalling_pct)
+
+        self.lhd_cutoff.setValue(self.defaults.LHD_cutoff_m3)
+        self.seed.setValue(self.defaults.seed or 0)
+        self.arching_pct.setValue(self.defaults.arching_pct)
+        self.arch_factor.setValue(self.defaults.arch_stress_conc)
+
+        self.draw_height.setValue(self.secondary.draw_height)
+        self.max_caving.setValue(self.secondary.max_caving_height)
+        self.swell.setValue(self.secondary.swell_factor)
+        self.draw_width.setValue(self.secondary.active_draw_width)
+        self.add_fines.setValue(self.secondary.added_fines_pct)
+        self.rate.setValue(self.secondary.rate_cm_day)
+        self.upper_w.setValue(self.secondary.drawbell_upper_width)
+        self.lower_w.setValue(self.secondary.drawbell_lower_width)
+
+        if hasattr(self, "nblocks"):
+            self.nblocks.setValue(max(100, int(self.nblocks.value())))
+
+    def _apply_settings_state(self, state: dict):
+        rock_data = state.get("rock")
+        if isinstance(rock_data, dict):
+            self.rock = RockMass(**rock_data)
+
+        joint_sets_data = state.get("joint_sets")
+        if isinstance(joint_sets_data, list) and joint_sets_data:
+            rebuilt_sets: List[JointSet] = []
+            for idx, js_dict in enumerate(joint_sets_data, start=1):
+                spacing_dict = js_dict.get("spacing") if isinstance(js_dict, dict) else {}
+                if not isinstance(spacing_dict, dict):
+                    spacing_dict = {}
+                spacing = SpacingDist(
+                    spacing_dict.get("type", "trunc_exp"),
+                    spacing_dict.get("min", 0.3),
+                    spacing_dict.get("mean", spacing_dict.get("min", 0.3)),
+                    spacing_dict.get("max_or_90pct", spacing_dict.get("mean", 1.0)),
+                    spacing_dict.get("max_obs"),
+                )
+                rebuilt_sets.append(
+                    JointSet(
+                        name=js_dict.get("name", f"Set{idx}"),
+                        mean_dip=js_dict.get("mean_dip", 45.0),
+                        dip_range=js_dict.get("dip_range", 10.0),
+                        mean_dip_dir=js_dict.get("mean_dip_dir", 0.0),
+                        dip_dir_range=js_dict.get("dip_dir_range", 20.0),
+                        spacing=spacing,
+                        JC=js_dict.get("JC", 20),
+                    )
+                )
+            if rebuilt_sets:
+                self.joint_sets = rebuilt_sets
+
+        cave_data = state.get("cave")
+        if isinstance(cave_data, dict):
+            self.cave = CaveFace(**cave_data)
+
+        defaults_data = state.get("defaults")
+        if isinstance(defaults_data, dict):
+            self.defaults = Defaults(**defaults_data)
+
+        secondary_data = state.get("secondary")
+        if isinstance(secondary_data, dict):
+            self.secondary = SecondaryRun(**secondary_data)
+
+        primary_data = state.get("primary")
+        if isinstance(primary_data, dict) and hasattr(self, "nblocks"):
+            try:
+                self.nblocks.setValue(int(primary_data.get("nblocks", self.nblocks.value())))
+            except (TypeError, ValueError):
+                pass
+
+        self._update_ui_from_models()
+
+        selected_combo = state.get("selected_joint_combination")
+        if isinstance(selected_combo, list) and len(selected_combo) == 3:
+            combo_tuple = tuple(int(i) for i in selected_combo)
+            idx = self.combo_joint_combination.findData(combo_tuple)
+            if idx >= 0:
+                self.combo_joint_combination.setCurrentIndex(idx)
+
+        mc_state = state.get("monte_carlo", {})
+        if isinstance(mc_state, dict):
+            if "runs" in mc_state and hasattr(self, "mc_runs"):
+                try:
+                    self.mc_runs.setValue(int(mc_state.get("runs", self.mc_runs.value())))
+                except (TypeError, ValueError):
+                    pass
+            if "blocks_per_run" in mc_state and hasattr(self, "mc_blocks"):
+                try:
+                    self.mc_blocks.setValue(int(mc_state.get("blocks_per_run", self.mc_blocks.value())))
+                except (TypeError, ValueError):
+                    pass
+            if "variation_pct" in mc_state and hasattr(self, "mc_variation"):
+                try:
+                    self.mc_variation.setValue(float(mc_state.get("variation_pct", self.mc_variation.value())))
+                except (TypeError, ValueError):
+                    pass
+            self._apply_mc_selection(mc_state.get("selection"))
+
+        chart_titles = state.get("chart_titles")
+        if isinstance(chart_titles, dict):
+            for key, text in chart_titles.items():
+                widget = self._chart_title_widgets.get(key)
+                if isinstance(widget, QLineEdit):
+                    prev = widget.blockSignals(True)
+                    widget.setText(str(text))
+                    widget.blockSignals(prev)
+
+        axis_formats = state.get("axis_formats")
+        if isinstance(axis_formats, dict):
+            for axis, choice in axis_formats.items():
+                combo = self._axis_format_combos.get(axis)
+                if isinstance(combo, QComboBox):
+                    idx = combo.findText(str(choice))
+                    if idx >= 0:
+                        prev = combo.blockSignals(True)
+                        combo.setCurrentIndex(idx)
+                        combo.blockSignals(prev)
+
+        series_styles = state.get("series_styles")
+        if isinstance(series_styles, dict):
+            for label, style in series_styles.items():
+                if isinstance(style, dict):
+                    self._apply_series_style(label, style)
+
+        self.update_models_from_ui()
+        self._refresh_all_plots()
+
+    def on_save_settings(self):
+        try:
+            state = self._gather_settings_state()
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot save", f"Failed to gather settings:\n{exc}")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save settings",
+            "bcf_settings.json",
+            "JSON files (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, indent=2)
+        except OSError as exc:
+            QMessageBox.critical(self, "Save failed", f"Could not save settings:\n{exc}")
+            return
+        QMessageBox.information(self, "Settings saved", f"Settings written to:\n{path}")
+
+    def on_load_settings(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load settings",
+            "bcf_settings.json",
+            "JSON files (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                state = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            QMessageBox.critical(self, "Load failed", f"Could not load settings:\n{exc}")
+            return
+
+        if not isinstance(state, dict):
+            QMessageBox.critical(self, "Load failed", "Settings file format is not recognized.")
+            return
+
+        try:
+            self._apply_settings_state(state)
+        except Exception as exc:
+            QMessageBox.critical(self, "Load failed", f"Could not apply settings:\n{exc}")
+            return
+
+        QMessageBox.information(self, "Settings loaded", f"Settings loaded from:\n{path}")
 
     def on_add_joint_set(self):
         js = JointSet(
