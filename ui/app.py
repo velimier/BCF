@@ -19,6 +19,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 from matplotlib.ticker import ScalarFormatter, StrMethodFormatter
+from matplotlib.colors import to_rgba
 
 from ..engine.models import RockMass, JointSet, SpacingDist, CaveFace, Defaults, SecondaryRun, PrimaryBlock
 from ..engine.primary import generate_primary_blocks
@@ -216,6 +217,10 @@ class PlotWidget(QWidget):
         )
         self.fig.set_facecolor("#f3f6fb")
         self.has_data = False
+        self._legend_enabled = True
+
+    def set_legend_enabled(self, enabled: bool):
+        self._legend_enabled = bool(enabled)
 
     def plot_distributions(self, prim_stats: dict, sec_stats: dict | None = None, title: str = ""):
         self.fig.clear()
@@ -245,6 +250,7 @@ class PlotWidget(QWidget):
         styles: List[Dict[str, object]] | None = None,
         x_formatter=None,
         y_formatter=None,
+        envelopes: List[Dict[str, object]] | None = None,
     ):
         self.fig.clear()
         ax = self.fig.add_subplot(111)
@@ -261,6 +267,7 @@ class PlotWidget(QWidget):
             style_lookup = styles
         elif isinstance(styles, list):
             style_list = styles
+        line_colors: Dict[str, str] = {}
         for i, ys in enumerate(ys_list):
             label = labels[i] if labels and i < len(labels) else None
             cur_xs = xs_list[i] if i < len(xs_list) else xs_list[0] if xs_list else []
@@ -274,13 +281,45 @@ class PlotWidget(QWidget):
             color = style.get("color") if isinstance(style, dict) else None
             linestyle = style.get("linestyle") if isinstance(style, dict) and style.get("linestyle") else "-"
             linewidth = style.get("linewidth") if isinstance(style, dict) and style.get("linewidth") else 1.5
-            ax.plot(cur_xs, ys, label=display_label, color=color, linestyle=linestyle, linewidth=linewidth)
+            line_objs = ax.plot(cur_xs, ys, label=display_label, color=color, linestyle=linestyle, linewidth=linewidth)
+            if line_objs:
+                key = label if label is not None else display_label or f"series_{i}"
+                line_colors[key] = line_objs[0].get_color()
         if logx:
             ax.set_xscale("log")
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.set_title(title)
         ax.grid(True, which="both", linestyle=":", color="#cfd6e6", linewidth=0.6)
+        if envelopes:
+            for env in envelopes:
+                env_xs = env.get("xs") if isinstance(env, dict) else None
+                env_min = env.get("min") if isinstance(env, dict) else None
+                env_max = env.get("max") if isinstance(env, dict) else None
+                env_label = env.get("label") if isinstance(env, dict) else None
+                if not env_xs or not env_min or not env_max:
+                    continue
+                style = {}
+                if env_label is not None:
+                    if style_lookup:
+                        style = style_lookup.get(env_label, {})
+                    elif isinstance(style_list, list) and labels:
+                        try:
+                            idx = labels.index(env_label)
+                        except ValueError:
+                            idx = -1
+                        if idx >= 0 and idx < len(style_list):
+                            style = style_list[idx]
+                color = style.get("color") if isinstance(style, dict) and style.get("color") else None
+                if not color and env_label is not None:
+                    color = line_colors.get(env_label)
+                if not color and env_label is not None:
+                    display_name = style.get("label") if isinstance(style, dict) and style.get("label") else env_label
+                    color = line_colors.get(display_name, color)
+                if not color:
+                    color = "#1f77b4"
+                rgba = to_rgba(color, alpha=0.18)
+                ax.fill_between(env_xs, env_min, env_max, color=rgba)
         show_legend = bool(ax.get_legend_handles_labels()[1])
         self._finalize_axes(ax, show_legend=show_legend)
         if x_formatter is not None:
@@ -300,8 +339,9 @@ class PlotWidget(QWidget):
                 ax.spines[spine].set_linewidth(0.8)
         ax.tick_params(axis="both", colors="#2e3650", labelsize=9)
         ax.set_facecolor("#ffffff")
+        effective_show = show_legend and self._legend_enabled
         legend = None
-        if show_legend:
+        if effective_show:
             handles, legend_labels = ax.get_legend_handles_labels()
             if legend_labels:
                 legend = ax.legend(
@@ -314,7 +354,7 @@ class PlotWidget(QWidget):
                     labelspacing=0.6,
                 )
         ax.figure.set_facecolor("#f3f6fb")
-        if show_legend and legend is not None:
+        if effective_show and legend is not None:
             ax.figure.subplots_adjust(left=0.12, right=0.74, top=0.88, bottom=0.16)
         else:
             ax.figure.subplots_adjust(left=0.12, right=0.96, top=0.88, bottom=0.16)
@@ -377,6 +417,9 @@ class MainWindow(QMainWindow):
         self._last_monte_carlo_settings: dict | None = None
         self._last_primary_stats: dict | None = None
         self._last_secondary_stats: dict | None = None
+
+        self._legend_enabled = True
+        self._mc_use_shaded_envelope = False
 
         self._series_style_widgets: Dict[str, Dict[str, QWidget]] = {}
         self._series_color_cursor = 0
@@ -794,6 +837,7 @@ class MainWindow(QMainWindow):
 
         plot_layout = QVBoxLayout()
         self.plot_primary = PlotWidget()
+        self.plot_primary.set_legend_enabled(self._legend_enabled)
         plot_layout.addWidget(self.plot_primary)
         plot_layout.setStretch(plot_layout.indexOf(self.plot_primary), 1)
         btn_row = QHBoxLayout()
@@ -842,6 +886,7 @@ class MainWindow(QMainWindow):
 
         plot_layout = QVBoxLayout()
         self.plot_secondary = PlotWidget()
+        self.plot_secondary.set_legend_enabled(self._legend_enabled)
         plot_layout.addWidget(self.plot_secondary)
         plot_layout.setStretch(plot_layout.indexOf(self.plot_secondary), 1)
         btn_row = QHBoxLayout(); btn_row.addStretch(1)
@@ -887,10 +932,14 @@ class MainWindow(QMainWindow):
         self.chk_show_secondary.setChecked(True)
         toggle_row.addWidget(self.chk_show_primary)
         toggle_row.addWidget(self.chk_show_secondary)
+        self.chk_mc_shaded = QCheckBox("Shade min–max span")
+        self.chk_mc_shaded.setChecked(self._mc_use_shaded_envelope)
+        toggle_row.addWidget(self.chk_mc_shaded)
         toggle_row.addStretch(1)
         plot_layout.addLayout(toggle_row)
 
         self.plot_monte_carlo = PlotWidget()
+        self.plot_monte_carlo.set_legend_enabled(self._legend_enabled)
         plot_layout.addWidget(self.plot_monte_carlo)
         plot_layout.setStretch(plot_layout.indexOf(self.plot_monte_carlo), 1)
         btn_row = QHBoxLayout(); btn_row.addStretch(1)
@@ -954,6 +1003,15 @@ class MainWindow(QMainWindow):
         combo_y.currentIndexChanged.connect(self._refresh_all_plots)
         layout.addWidget(axis_group)
 
+        legend_group = QGroupBox("Legend")
+        legend_layout = QHBoxLayout(legend_group)
+        self.chk_show_legend = QCheckBox("Show chart legends")
+        self.chk_show_legend.setChecked(self._legend_enabled)
+        legend_layout.addWidget(self.chk_show_legend)
+        legend_layout.addStretch(1)
+        self.chk_show_legend.toggled.connect(self._on_toggle_legend)
+        layout.addWidget(legend_group)
+
         series_group = QGroupBox("Series styling")
         series_layout = QVBoxLayout(series_group)
         series_layout.addWidget(QLabel("Configure legend label, color, dash, and width for each data series."))
@@ -987,6 +1045,7 @@ class MainWindow(QMainWindow):
         self.btn_save_mc_report.clicked.connect(self.on_save_monte_carlo_report)
         self.chk_show_primary.toggled.connect(self._refresh_monte_carlo_plot)
         self.chk_show_secondary.toggled.connect(self._refresh_monte_carlo_plot)
+        self.chk_mc_shaded.toggled.connect(self._on_toggle_mc_shaded)
         self.action_save_settings.triggered.connect(self.on_save_settings)
         self.action_load_settings.triggered.connect(self.on_load_settings)
         self.sig.done_primary.connect(self.on_done_primary)
@@ -1112,6 +1171,7 @@ class MainWindow(QMainWindow):
                 "blocks_per_run": int(self.mc_blocks.value()) if hasattr(self, "mc_blocks") else None,
                 "variation_pct": float(self.mc_variation.value()) if hasattr(self, "mc_variation") else None,
                 "selection": self._serialize_mc_selection(),
+                "use_shaded_envelope": bool(self.chk_mc_shaded.isChecked()) if hasattr(self, "chk_mc_shaded") else None,
             },
             "selected_joint_combination": list(selected_combo) if selected_combo else None,
             "chart_titles": {
@@ -1124,6 +1184,7 @@ class MainWindow(QMainWindow):
                 for axis, combo in self._axis_format_combos.items()
                 if isinstance(combo, QComboBox)
             },
+            "legend_enabled": bool(self.chk_show_legend.isChecked()) if hasattr(self, "chk_show_legend") else self._legend_enabled,
             "series_styles": {
                 label: self._collect_series_style(label)
                 for label in list(self._series_style_widgets.keys())
@@ -1277,6 +1338,11 @@ class MainWindow(QMainWindow):
                     self.mc_variation.setValue(float(mc_state.get("variation_pct", self.mc_variation.value())))
                 except (TypeError, ValueError):
                     pass
+            if "use_shaded_envelope" in mc_state and hasattr(self, "chk_mc_shaded"):
+                prev = self.chk_mc_shaded.blockSignals(True)
+                self.chk_mc_shaded.setChecked(bool(mc_state.get("use_shaded_envelope", False)))
+                self.chk_mc_shaded.blockSignals(prev)
+                self._mc_use_shaded_envelope = self.chk_mc_shaded.isChecked()
             self._apply_mc_selection(mc_state.get("selection"))
 
         chart_titles = state.get("chart_titles")
@@ -1298,6 +1364,16 @@ class MainWindow(QMainWindow):
                         prev = combo.blockSignals(True)
                         combo.setCurrentIndex(idx)
                         combo.blockSignals(prev)
+
+        legend_enabled = state.get("legend_enabled")
+        if legend_enabled is not None and hasattr(self, "chk_show_legend"):
+            prev = self.chk_show_legend.blockSignals(True)
+            self.chk_show_legend.setChecked(bool(legend_enabled))
+            self.chk_show_legend.blockSignals(prev)
+            self._legend_enabled = bool(legend_enabled)
+            for plot in (getattr(self, "plot_primary", None), getattr(self, "plot_secondary", None), getattr(self, "plot_monte_carlo", None)):
+                if isinstance(plot, PlotWidget):
+                    plot.set_legend_enabled(self._legend_enabled)
 
         series_styles = state.get("series_styles")
         if isinstance(series_styles, dict):
@@ -1633,6 +1709,7 @@ class MainWindow(QMainWindow):
 
             multi_combo = len(combo_order) > 1
             primary_series: List[Tuple[str, List[float]]] = []
+            primary_envelopes: List[Dict[str, object]] = []
             primary_xs: List[float] = []
             for label in combo_order:
                 stats_list = primary_results.get(label)
@@ -1642,13 +1719,26 @@ class MainWindow(QMainWindow):
                 primary_xs = xs_local
                 compact = self._compact_combo_label(label)
                 prefix = "P"
-                primary_series.append((f"{prefix} avg – {compact}", avg_line))
+                avg_label = f"{prefix} avg – {compact}"
+                primary_series.append((avg_label, avg_line))
                 primary_series.append((f"{prefix} min – {compact}", min_line))
                 primary_series.append((f"{prefix} max – {compact}", max_line))
+                primary_envelopes.append(
+                    {
+                        "label": f"{prefix} – {compact}",
+                        "avg_label": avg_label,
+                        "min_label": f"{prefix} min – {compact}",
+                        "max_label": f"{prefix} max – {compact}",
+                        "avg": avg_line,
+                        "min": min_line,
+                        "max": max_line,
+                    }
+                )
                 if not multi_combo:
                     break
 
             secondary_series: List[Tuple[str, List[float]]] = []
+            secondary_envelopes: List[Dict[str, object]] = []
             secondary_xs: List[float] = []
             for label in combo_order:
                 stats_list = secondary_results.get(label)
@@ -1658,9 +1748,21 @@ class MainWindow(QMainWindow):
                 secondary_xs = xs_local
                 compact = self._compact_combo_label(label)
                 prefix = "S"
-                secondary_series.append((f"{prefix} avg – {compact}", avg_line))
+                avg_label = f"{prefix} avg – {compact}"
+                secondary_series.append((avg_label, avg_line))
                 secondary_series.append((f"{prefix} min – {compact}", min_line))
                 secondary_series.append((f"{prefix} max – {compact}", max_line))
+                secondary_envelopes.append(
+                    {
+                        "label": f"{prefix} – {compact}",
+                        "avg_label": avg_label,
+                        "min_label": f"{prefix} min – {compact}",
+                        "max_label": f"{prefix} max – {compact}",
+                        "avg": avg_line,
+                        "min": min_line,
+                        "max": max_line,
+                    }
+                )
                 if not multi_combo:
                     break
 
@@ -1701,11 +1803,13 @@ class MainWindow(QMainWindow):
                     "primary": {
                         "xs": primary_xs,
                         "series": primary_series,
+                        "envelopes": primary_envelopes,
                     },
                     "secondary": (
                         {
                             "xs": secondary_xs,
                             "series": secondary_series,
+                            "envelopes": secondary_envelopes,
                         }
                         if secondary_series
                         else None
@@ -1789,6 +1893,13 @@ class MainWindow(QMainWindow):
         self._refresh_secondary_plot()
         self._refresh_monte_carlo_plot()
 
+    def _on_toggle_legend(self, checked: bool):
+        self._legend_enabled = bool(checked)
+        for plot in (getattr(self, "plot_primary", None), getattr(self, "plot_secondary", None), getattr(self, "plot_monte_carlo", None)):
+            if isinstance(plot, PlotWidget):
+                plot.set_legend_enabled(self._legend_enabled)
+        self._refresh_all_plots()
+
     def _refresh_primary_plot(self):
         stats = self._last_primary_stats
         if not stats:
@@ -1864,41 +1975,65 @@ class MainWindow(QMainWindow):
                 return text
         return fallback
 
+    def _on_toggle_mc_shaded(self, checked: bool):
+        self._mc_use_shaded_envelope = bool(checked)
+        self._refresh_monte_carlo_plot()
+
     def _refresh_monte_carlo_plot(self):
         result = self._last_monte_carlo_result
         xs_list: List[List[float]] = []
         lines: List[List[float]] = []
         labels: List[str] = []
         styles: Dict[str, Dict[str, object]] = {}
-        staged_series: List[Tuple[str, List[float], List[float]]] = []
+        envelopes: List[Dict[str, object]] = []
+
+        use_shaded = bool(getattr(self, "chk_mc_shaded", None) and self.chk_mc_shaded.isChecked())
+        self._mc_use_shaded_envelope = use_shaded
+
         label_names: List[str] = []
-
-        if result and self.chk_show_primary.isChecked():
-            primary = result.get("primary") or {}
-            xs = primary.get("xs")
-            series = primary.get("series") or []
-            if xs and series:
-                for label, values in series:
-                    staged_series.append((label, xs, values))
-                    label_names.append(label)
-
-        if result and self.chk_show_secondary.isChecked():
-            secondary = result.get("secondary") or {}
-            xs = secondary.get("xs")
-            series = secondary.get("series") or []
-            if xs and series:
-                for label, values in series:
-                    staged_series.append((label, xs, values))
-                    label_names.append(label)
-
+        if result:
+            for key in ("primary", "secondary"):
+                data = result.get(key) or {}
+                label_names.extend(label for label, _ in (data.get("series") or []))
         if label_names:
             self._ensure_series_style_controls(label_names)
 
-        for label, xs, values in staged_series:
-            xs_list.append(xs)
-            lines.append(values)
-            labels.append(label)
-            styles[label] = self._collect_series_style(label)
+        def stage_series(dataset: Optional[dict]):
+            nonlocal envelopes
+            if not dataset:
+                return
+            xs = dataset.get("xs")
+            if not xs:
+                return
+            if use_shaded:
+                for env in dataset.get("envelopes") or []:
+                    avg_label = env.get("avg_label") or env.get("label")
+                    avg_values = env.get("avg") if isinstance(env, dict) else None
+                    min_vals = env.get("min") if isinstance(env, dict) else None
+                    max_vals = env.get("max") if isinstance(env, dict) else None
+                    if avg_label and avg_values:
+                        xs_list.append(xs)
+                        lines.append(avg_values)
+                        labels.append(avg_label)
+                        styles[avg_label] = self._collect_series_style(avg_label)
+                        if min_vals and max_vals:
+                            envelopes.append({
+                                "label": avg_label,
+                                "xs": xs,
+                                "min": min_vals,
+                                "max": max_vals,
+                            })
+            else:
+                for label, values in dataset.get("series") or []:
+                    xs_list.append(xs)
+                    lines.append(values)
+                    labels.append(label)
+                    styles[label] = self._collect_series_style(label)
+
+        if result and self.chk_show_primary.isChecked():
+            stage_series(result.get("primary") or {})
+        if result and self.chk_show_secondary.isChecked():
+            stage_series(result.get("secondary") or {})
 
         if lines:
             title_text = self._chart_title("monte_carlo", "Monte Carlo cumulative mass envelopes")
@@ -1913,6 +2048,7 @@ class MainWindow(QMainWindow):
                 styles=styles,
                 x_formatter=self._axis_formatter_from_choice(self._axis_format_choice("x")),
                 y_formatter=self._axis_formatter_from_choice(self._axis_format_choice("y")),
+                envelopes=envelopes if use_shaded else None,
             )
             self.btn_save_mc_plot.setEnabled(True)
         else:
