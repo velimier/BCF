@@ -407,6 +407,7 @@ class MainWindow(QMainWindow):
         plot_layout = QVBoxLayout()
         self.plot_primary = PlotWidget()
         plot_layout.addWidget(self.plot_primary)
+        plot_layout.setStretch(plot_layout.indexOf(self.plot_primary), 1)
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
         self.btn_save_primary_plot = QPushButton("Save chart…")
@@ -452,6 +453,7 @@ class MainWindow(QMainWindow):
         plot_layout = QVBoxLayout()
         self.plot_secondary = PlotWidget()
         plot_layout.addWidget(self.plot_secondary)
+        plot_layout.setStretch(plot_layout.indexOf(self.plot_secondary), 1)
         btn_row = QHBoxLayout(); btn_row.addStretch(1)
         self.btn_save_secondary_plot = QPushButton("Save chart…")
         self.btn_save_secondary_plot.setEnabled(False)
@@ -497,6 +499,7 @@ class MainWindow(QMainWindow):
 
         self.plot_monte_carlo = PlotWidget()
         plot_layout.addWidget(self.plot_monte_carlo)
+        plot_layout.setStretch(plot_layout.indexOf(self.plot_monte_carlo), 1)
         btn_row = QHBoxLayout(); btn_row.addStretch(1)
         self.btn_save_mc_report = QPushButton("Save report…")
         self.btn_save_mc_report.setEnabled(False)
